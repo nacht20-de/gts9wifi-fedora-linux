@@ -1,0 +1,24 @@
+;; Let the gts9wifi fingerprint stack publish its runtime state under /run.
+;; This port's systemd and its services run in kernel_t and
+;; kernel_generic_helper_t rather than init_t/unconfined_service_t, so the
+;; usual *_var_run_t interfaces do not apply and every write to a /run path is
+;; denied. Under SELinux permissive that is invisible; under enforcing it stops
+;; the reader, because these two files are the handshake that arms the panel's
+;; FOD emission.
+(type gts9u_fingerprint_runtime_t)
+(typeattributeset file_type (gts9u_fingerprint_runtime_t))
+(typeattributeset non_security_file_type (gts9u_fingerprint_runtime_t))
+(roletype object_r gts9u_fingerprint_runtime_t)
+
+(filecon "/run/gts9u-fingerprint(/.*)?" any (system_u object_r gts9u_fingerprint_runtime_t ((s0) (s0))))
+(filecon "/run/gts9u-fingerprint-ui(/.*)?" any (system_u object_r gts9u_fingerprint_runtime_t ((s0) (s0))))
+
+;; The libfprint EL721 driver, inside fprintd, writes the active-lease file.
+(allow kernel_t gts9u_fingerprint_runtime_t (dir (create write add_name remove_name search read open getattr)))
+(allow kernel_t gts9u_fingerprint_runtime_t (file (create write read open getattr unlink setattr)))
+;; The D-Bus lease broker rewrites ready every two seconds.
+(allow kernel_generic_helper_t gts9u_fingerprint_runtime_t (dir (create write add_name remove_name search read open getattr)))
+(allow kernel_generic_helper_t gts9u_fingerprint_runtime_t (file (create write read open getattr unlink setattr)))
+;; The GNOME Shell, unconfined, only reads the active-lease file.
+(allow unconfined_t gts9u_fingerprint_runtime_t (dir (search read open getattr)))
+(allow unconfined_t gts9u_fingerprint_runtime_t (file (read open getattr)))

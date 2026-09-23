@@ -164,9 +164,27 @@ known benign artifact — the symbols resolve against the running kernel.
   for a transient user scope; it needs an active graphical session or a rule.
 - **The panel must be bright enough and awake.** Screen blanking mid-capture
   latches the trustlet.
-- **SELinux logs denials** for the lease broker writing
-  `/run/gts9u-fingerprint-ui` (`permissive=1`, so nothing is blocked yet). It
-  needs a proper label.
+- **SELinux**: both runtime paths are labelled `gts9u_fingerprint_runtime_t` by a
+  CIL module shipped at `rootfs/overlay/usr/share/gts9wifi/selinux/`. This port's
+  systemd and services run in `kernel_t` / `kernel_generic_helper_t` rather than
+  `init_t` / `unconfined_service_t`, so no `*_var_run_t` interface applies and
+  **both** writes were denied — the broker's lease and the driver's active-lease
+  file — invisibly, because the port runs permissive. Install with
+  `semodule -i gts9u_fingerprint.cil` and
+  `restorecon -R /run/gts9u-fingerprint /run/gts9u-fingerprint-ui`. Verified: 0
+  denials on the type for either writer, with the file correctly labelled.
+
+  Two traps found while doing this. The module must be **CIL**, not `.te`: on
+  this system `checkmodule` cannot resolve even `unconfined_t` from the devel
+  headers, so the traditional module toolchain does not work here. And
+  `SELinuxContext=` on the unit is *not* a fix — the transition itself is denied
+  (`nnp_transition`, because the unit sets `NoNewPrivileges`), which permissive
+  hides and enforcing would not.
+
+  The port is still nowhere near enforcing: this boot logged 33,265 denials,
+  most of them `{ search }` on `unlabeled_t` for `/usr/bin` and `/usr/lib64`,
+  i.e. the rootfs is largely **unlabelled**. That is a port-wide item, not a
+  fingerprint one.
 
 ## The trustlet latch
 
