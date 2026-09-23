@@ -20,7 +20,7 @@ reused, and a retired number is simply absent rather than reassigned
 | 11 | libcamera had no sensor helper, so max gain | fixed — helper added, AGC runs |
 | 13 | Charging bypass on 25 W+ chargers | planned — needs a `gnome-control-center` patch |
 | 14 | Double tap to turn on the screen | fixed — with a GNOME extension UI |
-| 15 | Under-display fingerprint sensor (EgisTec EL721) | in progress — secure world done; a finger capture returns no image |
+| 15 | Under-display fingerprint sensor (EgisTec EL721) | working — enrolled and verified through libfprint/fprintd; single-shot verify is ~20% |
 | 16 | Hardware video decode (iris / VPU 3.0) | fixed — the VPU decodes; application support is partial |
 | 17 | Speaker volume capped (~−19 dB) | fixed — Cirrus speaker-protection DSP firmware now loads |
 | 18 | `/`, `/etc`, `/usr` owned by the image build user | fixed — this had silently disabled *every* `tmpfiles.d` entry |
@@ -84,25 +84,52 @@ secure owner prints `SECURE_READY`, and the trustlet reaches a calibrated
 sensor's illumination interface (`fod_mode`, `fod_circle`, `fod_brightness`,
 `fod_ready`) exists.
 
-The capture path is where it stops, and the 2026-09-23 work re-characterised it.
-The reader does **not** have a four-capture budget: the trustlet latches on the
-first frame it *rejects* (result 39 `BAD_QUALITY`, status `0x80000000`). A lit panel
-with no finger gives a clean five-call session and a clean `EnrollFinal`; a dark or
-repeated frame latches it immediately. A 45 s power-down does **not** clear the
-latch (nor does a fresh process and `Prepare`, a secure-owner restart, or a 5 s
-cycle) — a reboot plus the first-time boot-only bring-up is the known-good
-recovery.
+The capture path now works end to end. A finger enrolled through the real
+libfprint/fprintd stack on 2026-09-24 — all 17 of 17 `EL721_ENROLL_STAGES`
+accepted, coverage climbing to 100, template under
+`/var/lib/fprint/fedora/el721/gts9u-el721/` — and then verified
+(`verify-match`, `matched_slot=3`, score 284854528).
 
-Behind that sits the real blocker: a fingertip placed correctly on a demonstrably
-lit reader still returns `coverage=0`. The illumination is the panel's own white
-content plus HBM (`fod_mode`), and the reader does image it (coverage 2 with no
-finger on the glass), but nothing comes back from a finger. The two kernel-side
-suspects are the panel's FOD FlatZ sequence — its `0xE0` block came from Samsung's
-panel data and may belong to another panel revision — and the touch-controller FOD
-interface (`fod_rect`/`fod_enable`/`fod_state`) that the reference driver uses and
-this port's touchscreen driver does not implement. What remains after that is the
-userspace half — a libfprint backend, fprintd, the GNOME Shell target overlay and
-the FTS FOD touch handling.
+Four things had to be fixed, and the earlier reading of the failure was wrong in
+two places:
+
+- **The latch is per session, not per boot.** The trustlet does latch on the
+  first frame it *rejects* (result 39 `BAD_QUALITY`), and while latched every
+  later reply carries status `0x88000000` and `coverage=0`. But a **new**
+  trustlet session starts clean, so no reboot is needed — a fresh fprintd action
+  recovers. Only the 45 s power-down and the in-session `EnrollFinal` failed to
+  clear it.
+- **The trigger is an ordinary contact, not a gesture.** Samsung reports a
+  fingerprint press as a low-power gesture frame, and the controller only runs
+  that scan with the display *off*: on a lit panel `fod_state` sat at sequence 0
+  for a whole 300 s action with a finger on the sensor. The port's touchscreen
+  driver now takes the press edge from the ordinary coordinate event and
+  consumes it, which also stops the press opening a desktop context menu over
+  the target.
+- **The white target must sit on the sensor.** The overlay's geometry is the
+  Ultra's; on this panel it drew the circle at x=2424, where a pressing finger
+  only ever reached coverage 35 — a partly covered sensor. Centred on x=2300 and
+  widened to 200 px, coverage climbs to 100.
+- **The capture needs time.** The reference settles 180 ms after the press edge,
+  a *light* settle rather than a finger settle, so the capture landed while the
+  fingertip was still arriving. At 700 ms — what the hand-built harness used —
+  the operator can press firmly and roll, which is what lifts coverage.
+
+The illumination is the panel's own white content plus HBM (`fod_mode`), drawn by
+the `gts9u-fingerprint-overlay` GNOME extension, which also owns the UI lease that
+gates HBM. The whole working arrangement — including the four adaptations to the
+vendored driver and overlay, which live in the gitignored
+`ubuntu-galaxy-tab-s9-ultra/` tree — is written up in
+`docs/Fingerprint-Stack.md`.
+
+Remaining gap: the identify path has **no coverage feedback** and takes one frame
+per attempt, so a single-shot verify succeeds roughly one time in five. Measured
+over five consecutive `fprintd-verify` runs: four no-matches (`result=32`,
+`matched_slot=0`, scores 9070848 / 9085184 / 9087232 / 9089280 — all near
+`0x8A...`, i.e. meaningless filler on a no-match, exactly as the vendored header
+warns) then a match (`result=0`, `matched_slot=3`, score 284854528). Closing it
+means retrying a rejected capture instead of reporting `FPI_MATCH_FAIL` on the
+first frame.
 
 **GNOME's unlock path is already present** — Settings enrolment, GDM via PAM
 and the lock screen via gnome-shell — and only needs libfprint to see a reader.
