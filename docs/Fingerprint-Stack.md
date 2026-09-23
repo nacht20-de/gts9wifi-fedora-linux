@@ -27,7 +27,7 @@ must read `ready <CLOCK_MONOTONIC microseconds>`, no more than 2 s ahead. The
 Shell extension asks the broker, and the broker writes it. The extension shows
 the white target only while the driver publishes `/run/gts9u-fingerprint/active`.
 
-## Four adaptations to the vendored tree
+## Six adaptations to the vendored tree
 
 All four are required. Each was measured, not guessed.
 
@@ -241,6 +241,57 @@ matched, while the same finger matched across separate sessions. So
 Verified: 10 attempts in one action produced 9 retries, 9 session rebuilds and
 9 fresh actions. The retry budget (`EL721_MATCH_RETRIES`, 9) is the driver's,
 because fprintd has no retry limit of its own.
+
+### 6. `libfprint/drivers/el721.c` — keep HBM lit for the whole action
+
+HBM on this DDIC is a **global** panel change, not a spot: entering FOD mode
+moves DCS `0x51` from the user's brightness to the FOD level (420 → 634 cd/m²,
+`ANA38407_FOD_BRIGHTNESS` 1623), and the GNOME Shell overlay compensates with a
+black shade whose opacity is derived from the backlight ratio. That shade can
+only follow *after* the panel has already changed — the overlay polls
+`fod_mode` every 50 ms — so every HBM transition brightens the whole display for
+about three frames before the shade catches up.
+
+The driver used to cycle `fod_mode` 0 → 1 on **every attempt**: it dropped the
+light on an early release, after each enrolment capture, and in `udfps_end` on
+every retry restart. Because fprintd restarts a verify as a fresh action, one
+unlock needing 2–4 attempts produced 4–8 whole-display flashes. The light is now
+released only when the action really ends:
+
+```diff
+-static void
+-udfps_end (FpiDeviceEl721 *self)
++static void
++udfps_end (FpiDeviceEl721 *self, gboolean keep_light)
+ {
+   if (!self->udfps_active)
+     return;
+-  write_child (EL721_PANEL, "fod_mode", "0\n", NULL);
++  if (!keep_light)
++    {
++      write_child (EL721_PANEL, "fod_mode", "0\n", NULL);
++      self->udfps_lit = FALSE;
++      g_unlink (EL721_VISUAL_STATE);
++    }
+   write_child (EL721_TOUCH, "fod_enable", "0\n", NULL);
+```
+
+The retry paths pass `TRUE` (`action_cleanup (self, TRUE)`), and the retry
+restart must not undo it — `udfps_begin` would otherwise re-arm "without HBM":
+
+```diff
+-  if (!udfps_light (self, FALSE, error) || !udfps_publish (self, error))
++  if (self->match_retries == 0 && !udfps_light (self, FALSE, error))
+```
+
+An early release now keeps the panel lit (`touch-to-light held; finger released
+early`) instead of dropping HBM and re-entering it on the next press, and an
+enrolment keeps it lit between samples — a fresh **PRESS edge** is still required
+per capture, so the light staying on cannot trigger one.
+
+The panel's own 15 s watchdog still applies: it returns the panel to normal
+brightness if the driver stops refreshing, which bounds a held light to the
+press timeout even if userspace dies.
 
 ## Reading the reply: the capture-step count
 
