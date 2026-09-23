@@ -20,7 +20,7 @@ reused, and a retired number is simply absent rather than reassigned
 | 11 | libcamera had no sensor helper, so max gain | fixed — helper added, AGC runs |
 | 13 | Charging bypass on 25 W+ chargers | planned — needs a `gnome-control-center` patch |
 | 14 | Double tap to turn on the screen | fixed — with a GNOME extension UI |
-| 15 | Under-display fingerprint sensor (EgisTec EL721) | in progress — secure world done; the reader latches after four captures |
+| 15 | Under-display fingerprint sensor (EgisTec EL721) | in progress — secure world done; a finger capture returns no image |
 | 16 | Hardware video decode (iris / VPU 3.0) | fixed — the VPU decodes; application support is partial |
 | 17 | Speaker volume capped (~−19 dB) | fixed — Cirrus speaker-protection DSP firmware now loads |
 | 18 | `/`, `/etc`, `/usr` owned by the image build user | fixed — this had silently disabled *every* `tmpfiles.d` entry |
@@ -84,9 +84,23 @@ secure owner prints `SECURE_READY`, and the trustlet reaches a calibrated
 sensor's illumination interface (`fod_mode`, `fod_circle`, `fod_brightness`,
 `fod_ready`) exists.
 
-The blocker is the capture path: the reader accepts four samples and then latches
-(result 39 `BAD_QUALITY`, status `0x80000000`) until it is powered down for ~45 s.
-Enrolment needs many more samples than that. What remains after it is the
+The capture path is where it stops, and the 2026-09-23 work re-characterised it.
+The reader does **not** have a four-capture budget: the trustlet latches on the
+first frame it *rejects* (result 39 `BAD_QUALITY`, status `0x80000000`). A lit panel
+with no finger gives a clean five-call session and a clean `EnrollFinal`; a dark or
+repeated frame latches it immediately. A 45 s power-down does **not** clear the
+latch (nor does a fresh process and `Prepare`, a secure-owner restart, or a 5 s
+cycle) — a reboot plus the first-time boot-only bring-up is the known-good
+recovery.
+
+Behind that sits the real blocker: a fingertip placed correctly on a demonstrably
+lit reader still returns `coverage=0`. The illumination is the panel's own white
+content plus HBM (`fod_mode`), and the reader does image it (coverage 2 with no
+finger on the glass), but nothing comes back from a finger. The two kernel-side
+suspects are the panel's FOD FlatZ sequence — its `0xE0` block came from Samsung's
+panel data and may belong to another panel revision — and the touch-controller FOD
+interface (`fod_rect`/`fod_enable`/`fod_state`) that the reference driver uses and
+this port's touchscreen driver does not implement. What remains after that is the
 userspace half — a libfprint backend, fprintd, the GNOME Shell target overlay and
 the FTS FOD touch handling.
 
