@@ -122,14 +122,22 @@ vendored driver and overlay, which live in the gitignored
 `ubuntu-galaxy-tab-s9-ultra/` tree — is written up in
 `docs/Fingerprint-Stack.md`.
 
-Remaining gap: the identify path has **no coverage feedback** and takes one frame
-per attempt, so a single-shot verify succeeds roughly one time in five. Measured
-over five consecutive `fprintd-verify` runs: four no-matches (`result=32`,
-`matched_slot=0`, scores 9070848 / 9085184 / 9087232 / 9089280 — all near
-`0x8A...`, i.e. meaningless filler on a no-match, exactly as the vendored header
-warns) then a match (`result=0`, `matched_slot=3`, score 284854528). Closing it
-means retrying a rejected capture instead of reporting `FPI_MATCH_FAIL` on the
-first frame.
+A no-match is now retried instead of ending the action. The driver reports a
+retry, fprintd restarts the verify, and each attempt **rebuilds the secure
+session** — which is the part that matters, because the TA's matcher answers
+once per identity per session and then repeats that answer: measured, 21
+captures from a single press inside one session returned one identical reply and
+none matched, while the same finger matched across separate sessions. Verified:
+10 attempts in one action produced 9 retries, 9 session rebuilds and 9 fresh
+actions, and one run matched on attempt 8.
+
+What still limits verification is per-frame capture quality, not the retry
+machinery: one measured action had 10 attempts and not one frame the TA could
+use, and the budget ran out. A still finger covers the sensor poorly (still runs
+measured coverage 2–35, rolling reached 100), so pressing **and rolling** is what
+produces a good frame. `docs/Fingerprint-Stack.md` records the arrangement,
+including how to read the capture-step count as the quality signal the identify
+path otherwise lacks.
 
 **GNOME's unlock path is already present** — Settings enrolment, GDM via PAM
 and the lock screen via gnome-shell — and only needs libfprint to see a reader.

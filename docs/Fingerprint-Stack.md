@@ -179,16 +179,74 @@ Because a rejected first frame latches the session, the first press matters:
 place the finger deliberately, and vary placement between presses. Roughly three
 near-identical frames in a row also end the attempt with result 70.
 
-## Known gap: single-shot verify
+### 5. `libfprint/drivers/el721.c` — retry a no-match in a fresh session
 
-Enrolment accepts a sample only near 90 % coverage, but the identify path has
-**no coverage feedback** and takes one frame per attempt, so verification
-succeeds about one time in five. Over five consecutive `fprintd-verify` runs:
-four no-matches (`result=32`, `matched_slot=0`, scores 9070848 / 9085184 /
-9087232 / 9089280) then a match (`result=0`, `matched_slot=3`, score 284854528).
+The identify path hands the matcher one frame per attempt and has no coverage
+feedback, so a frame that is not good enough reads as a plain `NO_MATCH`
+(result 32) rather than `BAD_QUALITY` (39/41) — and cannot be told apart from a
+different finger. Reporting `FPI_MATCH_FAIL` on that first frame is what made
+verification a ~20 %-per-press lottery.
 
-The no-match scores are all near `0x8A...`, i.e. meaningless filler — the
-vendored header warns the score field is meaningless on a no-match, so never
-read a verdict from the score. The fix is to retry a rejected capture instead of
-reporting `FPI_MATCH_FAIL` on the first frame, which is what the driver's own
-match-retry machinery is for.
+The driver now reports a **retry** instead, which fprintd answers by restarting
+the verify. Two parts matter:
+
+```diff
++      if (self->match_retries < EL721_MATCH_RETRIES)
++        {
++          GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
++          ...
++          el721_complete_match_retry (FP_DEVICE (self), current, retry);
+```
+
+and, because fprintd restarts **without claiming the device again**, the QTEE
+session survives — and the TA's matcher answers once per identity per session,
+repeating that answer for every later capture in the same session. Measured: 21
+captures from one press inside one session returned one identical reply and none
+matched, while the same finger matched across separate sessions. So
+`operation_prepare` closes the session and opens a new one per action:
+
+```diff
+-  /* ... only restore the sensor power that open() deliberately dropped. */
+-  return set_sensor_power (self, TRUE, error);
++  if (!set_sensor_power (self, TRUE, error))
++    return FALSE;
++  el721_qtee_close (self->qtee);
++  self->qtee = el721_qtee_open (EL721_FIRMWARE, error);
++  if (!self->qtee || !el721_qtee_prepare (self->qtee, error))
++    return FALSE;
+```
+
+Verified: 10 attempts in one action produced 9 retries, 9 session rebuilds and
+9 fresh actions. The retry budget (`EL721_MATCH_RETRIES`, 9) is the driver's,
+because fprintd has no retry limit of its own.
+
+## Reading the reply: the capture-step count
+
+A useful quality signal falls out of the identify reply: how many
+`CAPTURE_STEP` (87) iterations run before `CAPTURE_SUCCESS` (6).
+
+- a good frame terminates on the first step — `steps=4,5:0,87:0,6:0,0:0`
+- a frame the TA cannot use runs the full four — `steps=4,5:0,87:0,87:0,87:0,87:0,6:0,0:32`
+
+In the run that matched, the successful attempt was the only one-step capture.
+This is the closest thing to the coverage feedback the identify path lacks, and
+it is what to watch when tuning capture.
+
+## Known gap: per-frame capture quality
+
+The retry machinery is in place and verified, but what still limits verification
+is how often a single capture is good enough: one measured action had 10
+attempts and **not one** good frame, and the budget ran out (the client then sees
+a real `verify-no-match`). Across separate actions the rate has measured between
+roughly one in five and one in ten.
+
+The no-match scores are all near `0x8A...` (9070848, 9085184, 9087232, 9089280)
+while real matches scored 83538176 and 284854528 — so the score field is
+meaningless on a no-match, exactly as the vendored header warns. Never read a
+verdict from it; read `result` (0 = match, 32 = no-match) and `matched_slot`.
+
+This is a capture problem, not a plumbing one: a still finger covers the sensor
+poorly (still-finger runs measured coverage 2–35, while rolling reached 100), so
+pressing **and rolling** is what produces a good frame. The open questions are
+whether a longer settle gives the roll time to land, and whether the retry budget
+should be larger — both are cheap to measure now that the step count is visible.
