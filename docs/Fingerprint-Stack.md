@@ -47,13 +47,17 @@ FTS1BA90A.
 
 180 ms covers the Shell observer and a few compositor frames: it is a *light*
 settle, not a finger settle. A capture that early lands while the fingertip is
-still arriving and scores low coverage (max 35/100 over a whole run). 700 ms is
-what the hand-built harness used, and it lets the operator press firmly and roll.
+still arriving and scores low coverage. 1200 ms gives a **still** finger time to
+settle and flatten against the glass, which matters because a still press cannot
+make up for an early capture by moving. Measured with a firm still press: at
+700 ms every attempt ran the TA's full four capture steps and an action of 10
+attempts produced no match at all; at 1200 ms one-step frames appear and matches
+arrive.
 
 ```diff
 -#define EL721_LIGHT_SETTLE_US (180 * 1000)
 +#ifndef EL721_LIGHT_SETTLE_US
-+#define EL721_LIGHT_SETTLE_US (700 * 1000)
++#define EL721_LIGHT_SETTLE_US (1200 * 1000)
 +#endif
 ```
 
@@ -232,21 +236,36 @@ In the run that matched, the successful attempt was the only one-step capture.
 This is the closest thing to the coverage feedback the identify path lacks, and
 it is what to watch when tuning capture.
 
-## Known gap: per-frame capture quality
+## Known gap: per-frame capture quality, and what fixed most of it
 
-The retry machinery is in place and verified, but what still limits verification
-is how often a single capture is good enough: one measured action had 10
-attempts and **not one** good frame, and the budget ran out (the client then sees
-a real `verify-no-match`). Across separate actions the rate has measured between
-roughly one in five and one in ten.
+This sensor images a **patch** of the fingerprint per frame. Rolling sweeps more
+of the print across it (that is how enrolment reached coverage 100), so a rolled
+template and a still probe disagree — the probe covers only part of the template
+and about four frames in five no-match. Measured with a rolled template and a
+still press: 5 attempts to a match, and one action of 10 attempts that never
+matched at all.
+
+What closes the gap is enrolling the way the sensor will actually be used:
+
+- **Enrol with still presses**, shifting position and finger part between presses
+  (pad, tip, up, down, left, right). Coverage still climbs to 100 because each
+  press contributes a different patch, and the resulting template agrees with a
+  still probe. Measured: 17/17 stages, coverage 100, zero FATALs.
+- **Press on the sensor's centre.** The circle is 200 px across but the active
+  area is smaller; presses 50 px off centre measurably hurt.
+- **Press firmly and hold ~2 s.**
+
+With a still-press template, two consecutive still-press verifications matched in
+**3 and 4 attempts** (capture steps 4,3,1 and 4,4,4,2 — the good frame is the one
+that terminates in one step). No rolling needed.
+
+Still-press enrolment has one trap: poor frames from the same spot look alike,
+which trips the trustlet's ~3-identical-frames abort (result 70) and loses the
+whole action, because the accepted count does not survive a session. Varying the
+finger part and position between presses is what avoids it — a run that pressed
+the same spot stalled at coverage 6 with 3 accepted and then aborted.
 
 The no-match scores are all near `0x8A...` (9070848, 9085184, 9087232, 9089280)
 while real matches scored 83538176 and 284854528 — so the score field is
 meaningless on a no-match, exactly as the vendored header warns. Never read a
 verdict from it; read `result` (0 = match, 32 = no-match) and `matched_slot`.
-
-This is a capture problem, not a plumbing one: a still finger covers the sensor
-poorly (still-finger runs measured coverage 2–35, while rolling reached 100), so
-pressing **and rolling** is what produces a good frame. The open questions are
-whether a longer settle gives the roll time to land, and whether the retry budget
-should be larger — both are cheap to measure now that the step count is visible.

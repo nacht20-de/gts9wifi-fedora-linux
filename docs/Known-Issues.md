@@ -131,13 +131,16 @@ none matched, while the same finger matched across separate sessions. Verified:
 10 attempts in one action produced 9 retries, 9 session rebuilds and 9 fresh
 actions, and one run matched on attempt 8.
 
-What still limits verification is per-frame capture quality, not the retry
-machinery: one measured action had 10 attempts and not one frame the TA could
-use, and the budget ran out. A still finger covers the sensor poorly (still runs
-measured coverage 2–35, rolling reached 100), so pressing **and rolling** is what
-produces a good frame. `docs/Fingerprint-Stack.md` records the arrangement,
-including how to read the capture-step count as the quality signal the identify
-path otherwise lacks.
+Verification now works with a **still press** — no rolling — taking about 3–4
+presses. The sensor images a patch of the fingerprint per frame, so a rolled
+template and a still probe disagree; re-enrolling with still presses (shifting
+position and finger part between presses, coverage still reaching 100) makes the
+template agree with the probe, and a longer capture settle (1200 ms, up from
+700 ms) gives a still finger time to settle and flatten. Two consecutive
+still-press verifications matched in 3 and 4 attempts.
+
+`docs/Fingerprint-Stack.md` records the arrangement, including how to read the
+capture-step count as the quality signal the identify path otherwise lacks.
 
 **GNOME's unlock path is already present** — Settings enrolment, GDM via PAM
 and the lock screen via gnome-shell — and only needs libfprint to see a reader.
