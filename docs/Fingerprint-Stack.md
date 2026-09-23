@@ -293,6 +293,11 @@ The panel's own 15 s watchdog still applies: it returns the panel to normal
 brightness if the driver stops refreshing, which bounds a held light to the
 press timeout even if userspace dies.
 
+Verified on the tablet: a successful unlock that needed three attempts made
+exactly **2** HBM transitions (`fod_mode` 1 at the first press, 0 when the action
+ended) instead of the 6 it would have made while cycling per attempt, sampled at
+20 ms from `/sys/class/backlight/ae94000.dsi.0/fod_mode`.
+
 ### 7. `libfprint/drivers/el721-identify-wire.h` — a press counts even if the finger was already down
 
 The capture rule used to be `opcode == 4 && edge && pressed && !was_pressed`, and
@@ -330,6 +335,11 @@ ordinary panel touch; gating that trigger by the sensor's `fod_rect` (the
 remedy deferred in the first version of the kernel driver) is what would remove
 that, and the driver still writes the reference device's rect rather than this
 board's.
+
+Verified on the tablet: three attempts produced **three** captures from three
+presses — one press each, with no discarded press and no lift-and-press — and
+the third matched (`verify result=0`, `matched_slot=3`, score 217748224,
+`steps=4,5:0,87:0,87:0,6:0,0:0`).
 
 ## Reading the reply: the capture-step count
 
