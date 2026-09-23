@@ -20,7 +20,7 @@ reused, and a retired number is simply absent rather than reassigned
 | 11 | libcamera had no sensor helper, so max gain | fixed — helper added, AGC runs |
 | 13 | Charging bypass on 25 W+ chargers | planned — needs a `gnome-control-center` patch |
 | 14 | Double tap to turn on the screen | fixed — with a GNOME extension UI |
-| 15 | Under-display fingerprint sensor (EgisTec EL721) | in progress — blocked at the TEE's `KEYMASTER_NOT_CONFIGURED` |
+| 15 | Under-display fingerprint sensor (EgisTec EL721) | in progress — secure world done; the reader latches after four captures |
 | 16 | Hardware video decode (iris / VPU 3.0) | fixed — the VPU decodes; application support is partial |
 | 17 | Speaker volume capped (~−19 dB) | fixed — Cirrus speaker-protection DSP firmware now loads |
 | 18 | `/`, `/etc`, `/usr` owned by the image build user | fixed — this had silently disabled *every* `tmpfiles.d` entry |
@@ -78,10 +78,17 @@ The Linux half and the whole secure processor are up on the tablet:
   userspace peers — `SP Apps were loaded successfully`, `SP Build v73.6`,
   remoteproc `running`.
 
-The session still stops at the TEE's `KEYMASTER_NOT_CONFIGURED` (cache status
-`9936`). What remains is the secure owner that configures `sp_keymaster` and
-restores HwVault credential 11, then the panel `cell_id` / HBM handling and a
-libfprint backend.
+The secure world is done: StrongBox keymaster is configured, the boot-only
+secure owner prints `SECURE_READY`, and the trustlet reaches a calibrated
+`Prepare`. Panel HBM and the module `cell_id` landed in the same round, so the
+sensor's illumination interface (`fod_mode`, `fod_circle`, `fod_brightness`,
+`fod_ready`) exists.
+
+The blocker is the capture path: the reader accepts four samples and then latches
+(result 39 `BAD_QUALITY`, status `0x80000000`) until it is powered down for ~45 s.
+Enrolment needs many more samples than that. What remains after it is the
+userspace half — a libfprint backend, fprintd, the GNOME Shell target overlay and
+the FTS FOD touch handling.
 
 **GNOME's unlock path is already present** — Settings enrolment, GDM via PAM
 and the lock screen via gnome-shell — and only needs libfprint to see a reader.
