@@ -27,7 +27,7 @@ must read `ready <CLOCK_MONOTONIC microseconds>`, no more than 2 s ahead. The
 Shell extension asks the broker, and the broker writes it. The extension shows
 the white target only while the driver publishes `/run/gts9u-fingerprint/active`.
 
-## Six adaptations to the vendored tree
+## Seven adaptations to the vendored tree
 
 All four are required. Each was measured, not guessed.
 
@@ -292,6 +292,44 @@ per capture, so the light staying on cannot trigger one.
 The panel's own 15 s watchdog still applies: it returns the panel to normal
 brightness if the driver stops refreshing, which bounds a held light to the
 press timeout even if userspace dies.
+
+### 7. `libfprint/drivers/el721-identify-wire.h` — a press counts even if the finger was already down
+
+The capture rule used to be `opcode == 4 && edge && pressed && !was_pressed`, and
+the poll seeds `finger_present` from the panel state the moment the action's
+target becomes available. That combination silently threw away the **first
+press of every action**: a user putting their finger down as the prompt appears
+is already "pressed" when the driver arms, so the press event the controller
+reports for it was rejected as a duplicate.
+
+Measured on the tablet, in one unlock attempt:
+
+```
+02:00:21  contact pressed=1 released=0 sequence=694 delta=1 capture=0   <- press ignored
+02:00:22  contact pressed=1 released=0 sequence=696 delta=1 capture=1   <- only after lifting
+02:00:32  contact pressed=1 released=0 sequence=699 delta=1 capture=0   <- retry, ignored again
+02:00:41  contact pressed=0 released=1 sequence=700 delta=1 capture=0
+02:00:42  contact pressed=1 released=0 sequence=701 delta=1 capture=1
+```
+
+The user had to lift and press again for *every* attempt, which is the reported
+"I have to press two times" — and with 2–4 attempts needed to match, it is also
+what made an unlock fail. The rule no longer consults the latch:
+
+```diff
+-  return opcode == 4 && edge && pressed && !was_pressed;
++  (void) was_pressed;
++  return opcode == 4 && edge && pressed;
+```
+
+A finger that is merely *resting* emits no event at all, so `edge && pressed`
+still means exactly one capture per press edge — the guarantee the latch was
+there to protect. The cost is that a tap *outside* the sensor now also burns one
+retry, because this port's kernel trigger publishes a FOD press edge for any
+ordinary panel touch; gating that trigger by the sensor's `fod_rect` (the
+remedy deferred in the first version of the kernel driver) is what would remove
+that, and the driver still writes the reference device's rect rather than this
+board's.
 
 ## Reading the reply: the capture-step count
 
