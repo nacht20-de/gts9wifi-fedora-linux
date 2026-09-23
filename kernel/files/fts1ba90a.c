@@ -105,6 +105,7 @@ struct fts1ba90a {
 	struct regulator *vddio;
 	bool dtw_enabled;	/* user toggle; the gesture is armed per suspend */
 	bool lpm_suspended;	/* suspended with rails up and the gesture armed */
+	bool gesture_armed;	/* armed outside a suspend, for a sleeping system */
 	u8 events[FTS_FIFO_MAX * FTS_EVENT_SIZE];
 };
 
@@ -568,8 +569,67 @@ static ssize_t double_tap_to_wake_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(double_tap_to_wake);
 
+/*
+ * Arm the double-tap gesture without suspending.
+ *
+ * This port's sleep mode keeps the system running with the display off, and
+ * there the gesture is the only way a touch is noticed at all: the controller
+ * reports a wake key rather than the touch, and a wake key is what a running
+ * system needs to bring the display back.  Writing 1 arms it, 0 disarms it, and
+ * it does nothing unless double_tap_to_wake is on.
+ *
+ * Arming is an i2c conversation with the controller, so the interrupt is held
+ * off around it - the threaded handler reads events over the same bus.
+ */
+static ssize_t wake_gesture_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct fts1ba90a *ts = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", ts->gesture_armed);
+}
+
+static ssize_t wake_gesture_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct fts1ba90a *ts = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	if (!ts->dtw_enabled)
+		return -EOPNOTSUPP;
+
+	if (enable == ts->gesture_armed)
+		return count;
+
+	disable_irq(ts->client->irq);
+	if (enable) {
+		/* Release anything still down before the controller stops reporting. */
+		fts1ba90a_suppress_touch(ts);
+		ret = fts1ba90a_arm_gesture(ts);
+	} else {
+		ret = fts1ba90a_disarm_gesture(ts);
+	}
+	enable_irq(ts->client->irq);
+
+	if (ret)
+		return ret;
+
+	ts->gesture_armed = enable;
+	dev_info(dev, "wake gesture %s\n", enable ? "armed" : "disarmed");
+
+	return count;
+}
+static DEVICE_ATTR_RW(wake_gesture);
+
 static struct attribute *fts1ba90a_attrs[] = {
 	&dev_attr_double_tap_to_wake.attr,
+	&dev_attr_wake_gesture.attr,
 	NULL,
 };
 
@@ -711,6 +771,9 @@ static int fts1ba90a_resume(struct device *dev)
 
 	if (ts->lpm_suspended) {
 		ts->lpm_suspended = false;
+
+		/* the suspend path leaves the controller disarmed */
+		ts->gesture_armed = false;
 
 		disable_irq_wake(ts->client->irq);
 
