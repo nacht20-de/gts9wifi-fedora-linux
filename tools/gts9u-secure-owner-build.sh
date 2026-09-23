@@ -16,6 +16,18 @@
 # sibling Ultra port ships them as 0002-/0003-qcomtee-register-dmabuf.patch, but
 # 0003 is malformed, so this port carries a valid replacement.
 #
+# Two build traps seen on 2026-09-23, both from a clean checkout:
+#   * the patch adds the two functions without declaring them, so the rebuild
+#     trips -Werror=missing-prototypes.  Configure the client with
+#     -DCMAKE_C_FLAGS=-Wno-error=missing-prototypes (or export CFLAGS before a
+#     *fresh* configure -- cmake only reads CFLAGS when it configures).
+#   * this script only *builds* $BUILD_DIR; it does not configure it.  Create it
+#     first, e.g. cmake -S quic-teec -B build-qcomtee -DCMAKE_BUILD_TYPE=Release
+#     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+#     -DCMAKE_INSTALL_PREFIX=$PREFIX -DQCBOR_DIR_HINT=$PREFIX.
+# The multi-pass capture harness is a separate compile against the same prefix
+# and needs -std=gnu11 -D_GNU_SOURCE for O_CLOEXEC.
+#
 # The owner source itself is the vendored reference copy
 # ubuntu-galaxy-tab-s9-ultra/packaging/libfprint/el721-secure-owner.c; it
 # #includes el721-qtee.c, which supplies the SPL listener, the TA assembler and
