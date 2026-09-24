@@ -621,7 +621,45 @@ number of at most 5 s is ignored. Confirm it reached the daemon with
 Raise it if presses start failing to match; the reference 1200 ms is the
 known-good upper bound.
 
-Note: `fprintd` on this tablet also carries a transient
-`/run/systemd/system/fprintd.service.d/debug.conf` setting
-`G_MESSAGES_DEBUG=all`, left over from debugging. It is harmless but makes the
-journal chatty and does not survive a reboot.
+### fprintd sandbox allowances must live outside /run
+
+`fprintd` needs the EL721 sandbox allowances to open the QTEE side of the
+stack. They were present only as
+`/run/systemd/system/fprintd.service.d/el721-qtee.conf`, which is tmpfs: nothing
+shipped it (not owned by any package) and nothing recreated it, so the next
+reboot would have dropped every `DeviceAllow` and `ReadWritePaths` entry and the
+reader would have failed with the EPERM "cannot open the QTEE object namespace"
+error. That hand-written drop-in is now installed persistently as
+`/etc/systemd/system/fprintd.service.d/10-gts9u-el721.conf`, and the `/run` copy
+is gone, so what is live is exactly the post-reboot configuration.
+
+Note that this is *not* the same file the repo ships for the device package at
+`ubuntu-galaxy-tab-s9-ultra/packaging/ubuntu-gts9u-device/usr/lib/systemd/system/fprintd.service.d/10-gts9u-el721.conf`.
+That variant also carries `Requires=`/`After=` on
+`ubuntu-gts9u-qcomtee.service`, `ubuntu-gts9u-fingerprint-ui.service` and
+`ubuntu-gts9u-fingerprint-secure.service`, plus
+`ExecStartPre=/usr/libexec/ubuntu-gts9u-fingerprint-secure --wait` and
+`StateDirectory`/`RuntimeDirectory`/`ExecStopPost` lines, and those services are
+not installed on this tablet. Installing it as-is would make fprintd depend on
+units that do not exist, so the minimal proven content was persisted instead:
+
+```ini
+[Service]
+DeviceAllow=/dev/tee0 rw
+DeviceAllow=/dev/spcom rw
+DeviceAllow=/dev/qsee_ipc_irq_spss rw
+DeviceAllow=/dev/dma_heap/qcom,secure-sp-tz rw
+DeviceAllow=/dev/esfp0 rw
+DeviceAllow=/dev/k250a rw
+ReadWritePaths=/var/lib/gts9u-fingerprint
+```
+
+Verify with `systemctl cat fprintd` (only the packaged unit, this drop-in and
+the systemd timeout fragment should be listed) and by running `fprintd-verify`
+until the journal logs `EL721 verify armed`, which only happens once the
+sandbox permits the device open.
+
+A related leftover was removed at the same time:
+`/run/systemd/system/fprintd.service.d/debug.conf` set `G_MESSAGES_DEBUG=all`,
+which made the journal chatty. Drop-ins under `/run` are easy to leave behind
+while debugging; check `systemctl cat fprintd` for them afterwards.
