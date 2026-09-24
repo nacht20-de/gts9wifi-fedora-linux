@@ -84,13 +84,50 @@ to x=2300 with a widened 200 px target, where a hand-built harness reached
 (see "Where the reader is" below): the target now sits on the measured centre
 and is sized to Samsung's own FOD active area.
 
+**Everything must stay a fraction of the panel.** The Shell hands the extension
+the *logical* monitor, and this panel runs at scale 2, so the logical axes
+(1280x800) are half the physical ones. An intermediate revision of this file
+expressed the geometry in physical millimetres and divided by those logical
+axes, which doubled the inset and parked the target in the bottom-right corner —
+the tap that diagnosed it landed at display (2160, 1600) against a sensor at
+(2360, 800). Anything written here in pixels must be divided by the panel's own
+dimensions first, never by `monitor.width`/`height`.
+
 ```diff
 -    const diameter = Math.round(shortAxis * 14.8 / 196);   /* Ultra's overlay */
 -    const inset = shortAxis * 16.7 / 196;
-+    const pxPerMm = 1000 / 92.55;                  /* this device's pixel_pitch */
-+    const diameter = Math.round(14.8 * pxPerMm);   /* 160 px: Samsung FOD active area */
-+    const inset = 18.5 * pxPerMm;                  /* 200 px: measured sensor centre */
++    const PANEL_SHORT = 1600;          /* physical panel, portrait */
++    const PANEL_LONG = 2560;
++    const PX_PER_MM = 1000 / 92.55;
++    const SENSOR_CX = 800;             /* centred across the short axis */
++    const SENSOR_INSET_MM = 18.5;      /* from the short edge */
++    const SENSOR_DIAMETER_MM = 14.8;   /* Samsung's FOD active area */
+...
++    const x = 1 - inset / PANEL_LONG;
++    const y = cx / PANEL_SHORT;
++    const size = Math.round(diameter / PANEL_SHORT * shortAxis);
 ```
+
+`extension.js` passes an optional third argument so the target can be moved
+without a logout — the Shell caches extension modules (proved with an atime
+probe: `disable`/`enable` does not re-read `geometry.js`), so editing this file
+otherwise costs a login. The override is read from
+`/run/gts9u-fingerprint/sensor-geometry` as `cx cy diameter` in **portrait panel
+pixels** (e.g. `800 2360 160`), cached for a second, and only accepted when it
+could describe this panel's reader: on the short axis, in the last third of the
+long axis, and no wider than half the short axis. Anything else falls back to
+the measured defaults — which is what makes the stale logical-units file
+(`400 1180 80`) written during the debugging above harmless. `/run` is tmpfs, so
+the override does not survive a reboot.
+
+**Measured result of the corrected geometry (2026-09-24).** Enrolment completed
+with coverage 100 and all 17 samples accepted in about two minutes, where the
+previous two attempts stalled at coverage 6 with 2 of 17 stages over 20 minutes
+— because the sensor had been sitting one pixel inside the illuminated circle.
+A still-press verify then matched on the first press (`matched_slot=3`,
+`steps=4,5:0,87:0,6:0,0:0`, where a single `87` iteration is the good-frame
+signature and four of them is the failure signature), and the GNOME lock screen
+unlocked with the fingerprint.
 
 ### Where the reader is, and why the target matters
 
