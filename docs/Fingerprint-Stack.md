@@ -663,3 +663,79 @@ A related leftover was removed at the same time:
 `/run/systemd/system/fprintd.service.d/debug.conf` set `G_MESSAGES_DEBUG=all`,
 which made the journal chatty. Drop-ins under `/run` are easy to leave behind
 while debugging; check `systemctl cat fprintd` for them afterwards.
+
+## What a reboot actually breaks, and why the reader died after one
+
+A reboot of this tablet broke fingerprint unlock in **two** independent ways at
+once, both of them configuration that had been set up by hand and lived in
+`/run` or nowhere at all.
+
+### 1. The secure startup was not automated
+
+`fprintd` opens the EL721 through QTEE, the TA asks the SPU's `sp_keymaster` for
+StrongBox, and the SPU gets its NVM from `sec_nvm`. None of that exists on a
+plain boot, and the failure is explicit:
+
+```
+Open failed with error: HwVault credential 11 could not be prepared for
+fingerprint encryption (cache status=9936; StrongBox Keymaster not configured)
+```
+
+Two hand-run steps were needed, and neither ran at boot:
+
+```sh
+sudo /usr/libexec/gts9wifi-spu-up              # SPSS + sec_nvm + spdaemon
+sudo /usr/libexec/gts9wifi-fingerprint-secure  # the boot-lifetime secure owner
+```
+
+The second prints `SECURE_READY` only once the HwVault credential cache has been
+restored. `/etc/systemd/system/gts9wifi-fingerprint-secure.service` now runs
+both, ordered `Before=fprintd.service`, so the reader works straight after a
+boot. Verified on a real reboot: the journal shows the unit starting, then
+`[spdaemon] SP Apps were loaded successfully.`, then the owner, with **zero**
+manual invocations.
+
+The ordering in that unit is not cosmetic. The port documents that the SPL
+interrupt listener must be registered **before the first SPU-backed crypto
+request**; a listener registered afterwards leaves HwVault unable to unwrap
+templates. When that had already happened on a boot, unlocking failed with a
+deterministic non-match — `verify result=32`, a score of ~9.1M against 78-145M
+for a real match, and `87` CAPTURE_STEP repeated four times, on presses dead
+centre of the sensor (`x=800 y=2366`). That state cannot be repaired in place;
+only a reboot with the correct ordering clears it. `Before=fprintd.service` is
+what prevents it.
+
+### 2. `/run/gts9u-fingerprint` was only ever created by hand
+
+The driver writes its active-lease file into that directory and does not create
+it, so once `/run` was empty every verify died immediately:
+
+```
+Device reported an error during verify:
+Failed to create file "/run/gts9u-fingerprint/active.VSOZV3": No such file or directory
+```
+
+The packaged drop-in declares `RuntimeDirectory=gts9u-fingerprint`; the
+hand-written one that had been persisted into
+`/etc/systemd/system/fprintd.service.d/` did not. It does now, so systemd
+recreates the directory on every `fprintd` start:
+
+```ini
+RuntimeDirectory=gts9u-fingerprint
+RuntimeDirectoryMode=0755
+```
+
+Verified by deleting the directory, restarting `fprintd`, and watching systemd
+recreate it with the `gts9u_fingerprint_runtime_t` label.
+
+### Settle status
+
+The verify settle is pinned to the port's validated 1200 ms by
+`/etc/systemd/system/fprintd.service.d/20-settle.conf`, while the compiled
+default is 700 ms (`EL721_LIGHT_SETTLE_VERIFY_US`). Keep that in mind when
+reading either value: the 700 ms speed result (press-to-match 1.20 s against
+1.69 s) is a real measurement, but the failure data gathered alongside it is
+**confounded** — several of those failures came from the poisoned secure state
+described above, not from the settle. Re-measuring 700 ms is worthwhile now that
+the stack is healthy; delete the drop-in or set
+`EL721_LIGHT_SETTLE_VERIFY_MS=700` and compare the match rate.
