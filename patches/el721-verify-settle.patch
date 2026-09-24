@@ -1,0 +1,118 @@
+--- a/libfprint/drivers/el721.c	2026-09-24 03:43:17.637689245 +0300
++++ b/libfprint/drivers/el721.c	2026-09-24 13:57:35.568522031 +0300
+@@ -779,6 +779,7 @@
+   gboolean event;
+   gboolean capture;
+   El721LightStep light_step;
++  gint64 settle_us;
+   g_autofree gchar *touch_enabled = NULL;
+   g_autofree gchar *ui_lease = NULL;
+   guint x;
+@@ -881,8 +882,10 @@
+         pressed ? FP_FINGER_STATUS_PRESENT : FP_FINGER_STATUS_NEEDED,
+         pressed ? FP_FINGER_STATUS_NEEDED : FP_FINGER_STATUS_PRESENT);
+     }
+-  light_step = el721_touch_light_step (&self->capture_deadline,
+-                                       g_get_monotonic_time (), pressed, capture);
++  settle_us = el721_light_settle_us (self->action != EL721_ACTION_ENROLL);
++  light_step = el721_touch_light_step_full (&self->capture_deadline,
++                                            g_get_monotonic_time (), pressed, capture,
++                                            settle_us);
+   if (light_step == EL721_LIGHT_ON || light_step == EL721_LIGHT_OFF)
+     {
+       /* An early release keeps the panel lit: dropping HBM here would flash the
+@@ -897,7 +900,7 @@
+             }
+           /* The panel write itself takes time. Settle from completion, not from
+            * before the DDIC command, without blocking the cancellation loop. */
+-          self->capture_deadline = g_get_monotonic_time () + EL721_LIGHT_SETTLE_US;
++          self->capture_deadline = g_get_monotonic_time () + settle_us;
+         }
+       g_message ("EL721 touch-to-light %s",
+                  light_step == EL721_LIGHT_ON ? "on; settling"
+--- a/libfprint/drivers/el721-touch-light.h	2026-09-24 01:11:59.224783450 +0300
++++ b/libfprint/drivers/el721-touch-light.h	2026-09-24 13:57:35.568487708 +0300
+@@ -15,6 +15,51 @@
+ #define EL721_LIGHT_SETTLE_US (1200 * 1000)
+ #endif
+ 
++/* Verification only needs the fingertip flat enough for the matcher, and every
++ * millisecond spent here is a millisecond the user waits at the lock screen.
++ * Enrolment keeps the longer reference settle above, because one marginal
++ * sample there costs a whole stage instead of a single re-press. The reference
++ * value's own measurement note says 700 ms already reached 88-100 coverage, so
++ * the reference carries margin that verification does not need. */
++#ifndef EL721_LIGHT_SETTLE_VERIFY_US
++#define EL721_LIGHT_SETTLE_VERIFY_US (700 * 1000)
++#endif
++
++/* Both settles are overridable at run time so they can be measured without a
++ * rebuild. fprintd is D-Bus activated and starts per operation, so a drop-in
++ * unit file plus a restart is enough:
++ *
++ *   EL721_LIGHT_SETTLE_MS=<ms>         applies to every action
++ *   EL721_LIGHT_SETTLE_VERIFY_MS=<ms>  verification and identification only
++ *
++ * Anything that is not a positive value of at most 5 s is ignored. The result
++ * is cached because this is consulted from the poll loop. */
++static inline gint64
++el721_light_settle_us (gboolean verify)
++{
++  static gint64 verify_us = -1;
++  static gint64 other_us = -1;
++  const char *env;
++  gint64 ms;
++
++  if (verify && verify_us >= 0)
++    return verify_us;
++  if (!verify && other_us >= 0)
++    return other_us;
++
++  env = verify ? g_getenv ("EL721_LIGHT_SETTLE_VERIFY_MS") : NULL;
++  if (!env)
++    env = g_getenv ("EL721_LIGHT_SETTLE_MS");
++  ms = env ? g_ascii_strtoll (env, NULL, 10) : 0;
++
++  if (verify)
++    verify_us = (ms > 0 && ms <= 5000) ? ms * 1000 : EL721_LIGHT_SETTLE_VERIFY_US;
++  else
++    other_us = (ms > 0 && ms <= 5000) ? ms * 1000 : EL721_LIGHT_SETTLE_US;
++
++  return verify ? verify_us : other_us;
++}
++
+ typedef enum
+ {
+   EL721_LIGHT_WAIT,
+@@ -24,8 +69,9 @@
+ } El721LightStep;
+ 
+ static inline El721LightStep
+-el721_touch_light_step (gint64 *deadline, gint64 now,
+-                        gboolean pressed, gboolean new_contact)
++el721_touch_light_step_full (gint64 *deadline, gint64 now,
++                             gboolean pressed, gboolean new_contact,
++                             gint64 settle_us)
+ {
+   if (*deadline)
+     {
+@@ -42,8 +88,18 @@
+     }
+   else if (new_contact && pressed)
+     {
+-      *deadline = now + EL721_LIGHT_SETTLE_US;
++      *deadline = now + settle_us;
+       return EL721_LIGHT_ON;
+     }
+   return EL721_LIGHT_WAIT;
+ }
++
++/* Reference timing, used by the offline tests. The driver calls the _full form
++ * so verification and enrolment can settle for different lengths. */
++static inline El721LightStep
++el721_touch_light_step (gint64 *deadline, gint64 now,
++                        gboolean pressed, gboolean new_contact)
++{
++  return el721_touch_light_step_full (deadline, now, pressed, new_contact,
++                                      EL721_LIGHT_SETTLE_US);
++}

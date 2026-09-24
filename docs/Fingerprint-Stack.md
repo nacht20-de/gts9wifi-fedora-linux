@@ -554,3 +554,74 @@ The quickest check is the one used here: launch Settings on the users panel,
 open the fingerprint dialog and click the tile — the finger list should drop
 down. Reading the AT-SPI tree is also a reliable way to see whether the popover
 actually mapped, since an unmapped popover contributes no accessible nodes.
+
+## Unlock latency: where the time actually goes
+
+Measured on the tablet 2026-09-24 from fprintd's own timestamps, a successful
+lock-screen unlock:
+
+| leg | before | after |
+| --- | --- | --- |
+| press detected -> frame taken | 1.218 s | 0.718 s |
+| frame taken -> match reported | 0.462 s | 0.462 s |
+| **press -> match** | **1.69 s** | **1.20 s** |
+
+and, separately:
+
+* power key -> the sensor accepts a press: ~4.3 s. Of that, ~2.4 s is the lock
+  screen coming up before PAM starts fprintd, then ~0.7 s to Claim, then ~1.2 s
+  for the secure-world open (`lookupTA(dualfp) returned 23; the TA was not
+  resident and is being loaded` plus the BAUTH prepare and optical blob upload).
+  This is the cost of the port's QTEE path, not of the settle.
+* match -> the greeter session is gone: ~2.2 s, which is GNOME Shell's own
+  unlock transition and not something this port controls.
+* match -> `report_verify_status: verify-match`: 3 ms.
+
+So the one leg this port owns is the illumination settle, and it was carrying
+about 500 ms of pure margin.
+
+### Why the settle was 1200 ms and why verification does not need it
+
+`EL721_LIGHT_SETTLE_US` exists because a frame taken too early lands while the
+fingertip is still flattening: the constant's own note records a capture 180 ms
+after the press edge scoring a maximum coverage of 35/100, against 88-100 once
+the wait reached 700 ms. 1200 ms is that measurement plus margin.
+
+Enrolment keeps the reference value, because a marginal sample there costs a
+whole stage. Verification does not: it needs one frame good enough for the
+matcher, and the matcher already retries internally (the `87` CAPTURE_STEP
+iterations), so a finger that is still settling keeps being sampled at later,
+better-settled moments inside the same action. Verification therefore settles
+for `EL721_LIGHT_SETTLE_VERIFY_US`, 700 ms.
+
+Measured after the change: three unlocks matched at 1.20-1.23 s from press,
+each on a single `87` iteration. Two presses in the same run failed with
+`result=32` and four rejected iterations — but that is the same signature as the
+failure seen at 1200 ms earlier the same day, so the shorter settle is not what
+causes it. `patches/el721-verify-settle.patch` is the change.
+
+### Tuning it without a rebuild
+
+Both settles read an environment override, which matters because fprintd is
+D-Bus activated and restarted per operation:
+
+```sh
+sudo mkdir -p /etc/systemd/system/fprintd.service.d
+sudo tee /etc/systemd/system/fprintd.service.d/10-settle.conf >/dev/null <<'CONF'
+[Service]
+Environment=EL721_LIGHT_SETTLE_VERIFY_MS=1200
+CONF
+sudo systemctl daemon-reload && sudo systemctl restart fprintd
+```
+
+`EL721_LIGHT_SETTLE_MS` applies to every action, `EL721_LIGHT_SETTLE_VERIFY_MS`
+only to verification and identification, and a value that is not a positive
+number of at most 5 s is ignored. Confirm it reached the daemon with
+`sudo cat /proc/$(systemctl show -p MainPID --value fprintd)/environ | tr '\0' '\n' | grep EL721`.
+Raise it if presses start failing to match; the reference 1200 ms is the
+known-good upper bound.
+
+Note: `fprintd` on this tablet also carries a transient
+`/run/systemd/system/fprintd.service.d/debug.conf` setting
+`G_MESSAGES_DEBUG=all`, left over from debugging. It is harmless but makes the
+journal chatty and does not survive a reboot.
