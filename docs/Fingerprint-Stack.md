@@ -76,18 +76,54 @@ about 5 s per press. 300 s is comfortable.
 
 ### 4. `gnome-shell/extensions/gts9u-fingerprint-overlay@agcarbajo/` — this panel
 
-`geometry.js` carries the Ultra's overlay proportions. On this 2560x1600 panel
-they put the target at x=2424, where a pressing finger only ever reached
-coverage 35 — the fingertip was clipping the sensor. x=2300 is where the harness
-reached 88–100. The target is also widened to 200 px so a fingertip lands fully
-on the sensor.
+`geometry.js` originally carried the Ultra's overlay proportions, which on this
+2560x1600 panel put the target at x=2424, where a pressing finger only ever
+reached coverage 35 — the fingertip was clipping the sensor. It was then moved
+to x=2300 with a widened 200 px target, where a hand-built harness reached
+88–100. Both were superseded on 2026-09-24 by measurements of the reader itself
+(see "Where the reader is" below): the target now sits on the measured centre
+and is sized to Samsung's own FOD active area.
 
 ```diff
--    const diameter = Math.round(shortAxis * 14.8 / 196);
+-    const diameter = Math.round(shortAxis * 14.8 / 196);   /* Ultra's overlay */
 -    const inset = shortAxis * 16.7 / 196;
-+    const diameter = Math.round(shortAxis * 200 / 1600);
-+    const inset = shortAxis * 260 / 1600;
++    const pxPerMm = 1000 / 92.55;                  /* this device's pixel_pitch */
++    const diameter = Math.round(14.8 * pxPerMm);   /* 160 px: Samsung FOD active area */
++    const inset = 18.5 * pxPerMm;                  /* 200 px: measured sensor centre */
 ```
+
+### Where the reader is, and why the target matters
+
+The sensor's centre is at portrait **(800, 2360)** on the 1600x2560 panel —
+centred across the short axis and 200 px (18.5 mm) in from it, i.e. landscape
+**(2360, 800)**. Three independent sources agree: the LineageOS overlay for this
+tablet (`DaViDev985/device_samsung_gts9wifi`:
+`physical_fingerprint_sensor_center_screen_location_y = 2360px`,
+`pixel_pitch = 92.55`); the touchscreen's own `fod_state`, which reports real
+presses at y 2357; and the stock firmware's device tree (`sec,max_coords =
+1752x2800` on the touch node, `samsung,support-optical-fingerprint` on the panel
+node). Samsung exposes the same geometry in millimetres at
+`/sys/class/fingerprint/fingerprint/position` — `marginBottom, marginLeft,
+areaWidth, areaHeight, imageSize, activeArea, draggingArea` — with the sysfs
+class provided by `fingerprint_sysfs.ko` and the attribute registered by the
+touchscreen driver. This port's ported FTS driver has no such attribute and the
+stock values are not in the device tree, so the numbers above come from the
+overlay plus measurement.
+
+**The panel has no local FOD illumination.** Measured 2026-09-24 with the Shell
+overlay disabled and the panel held in FOD mode: cycling `fod_mode` 10 s on /
+10 s off makes the whole screen pulse, and the DDIC's `fod_circle` command
+lights no visible region at all. The only bright area on screen during a
+fingerprint action is therefore this extension's white target plus the shade
+that dims everything outside it — which is why the target's position and size
+are load-bearing: the sensor has to sit inside the illuminated circle. At the
+old geometry (centre y 2300, 200 px, so 2200–2400) the sensor (centre 2360,
+~79 px, so 2321–2399) was inside by a single pixel at its far edge.
+`fod_circle_store` refuses to enable the circle unless `fod_mode` is already on
+(`if (enable && !ctx->fod_mode) ret = -EINVAL`), so the circle cannot be tested
+in isolation without a kernel change; Samsung's own local-HBM scheme — a mask
+brightness for the non-FOD area plus the DRM `finger_mask` connector property —
+is what would remove the whole-screen flash while keeping the sensor lit.
 
 `metadata.json` also needs this tablet's Shell, and `extension.js` needs one
 GNOME 50 fix — GNOME 50 dropped the `affectsInputRegion` parameter of
