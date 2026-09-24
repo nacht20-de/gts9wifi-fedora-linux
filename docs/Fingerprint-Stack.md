@@ -29,7 +29,7 @@ the white target only while the driver publishes `/run/gts9u-fingerprint/active`
 
 ## Seven adaptations to the vendored tree
 
-All four are required. Each was measured, not guessed.
+All seven are required. Each was measured, not guessed.
 
 ### 1. `libfprint/drivers/el721.c` — point at this tablet's touch controller
 
@@ -207,7 +207,11 @@ event**:
   cannot also open the desktop's long-press context menu over the illuminated
   circle;
 - `fod_rect` and `fod_state` exist with the interface the driver expects
-  (`fod_state` reads `pressed|released X Y SEQ`).
+  (`fod_state` reads `pressed|released X Y SEQ`); `fod_rect` is a kernel-side
+  filter only — see "The sensor window" below.
+- a contact outside the sensor window is **not** consumed: it is handed to
+  input as an ordinary touch, so the screen stays usable while a prompt is
+  armed.
 
 Deploy it by swapping the loadable module — no reflash:
 
@@ -274,102 +278,75 @@ Because a rejected first frame latches the session, the first press matters:
 place the finger deliberately, and vary placement between presses. Roughly three
 near-identical frames in a row also end the attempt with result 70.
 
-### 5. `libfprint/drivers/el721.c` — retry a no-match in a fresh session
+### 5. `libfprint/drivers/el721.c` — a retry only for a frame the TA rejects
 
 The identify path hands the matcher one frame per attempt and has no coverage
-feedback, so a frame that is not good enough reads as a plain `NO_MATCH`
+feedback, so a frame that is not good enough can read as a plain `NO_MATCH`
 (result 32) rather than `BAD_QUALITY` (39/41) — and cannot be told apart from a
-different finger. Reporting `FPI_MATCH_FAIL` on that first frame is what made
-verification a ~20 %-per-press lottery.
+different finger.
 
-The driver now reports a **retry** instead, which fprintd answers by restarting
-the verify. Two parts matter:
+An earlier version of this adaptation therefore retried *any* no-match inside
+the same action, rebuilding the QTEE session each time and bounding the loop
+with its own `EL721_MATCH_RETRIES` budget. **That was reverted, and should not
+be reinstated.** fprintd turns a retry into its own translatable notice —
+*"Place your finger on the reader again"* — which the user read as the reader
+rejecting a press that was fine ("before it never told me to place my finger
+again"), and it arrives exactly while the driver is rebuilding the secure
+session with the touch trigger disarmed, so the press that follows is dropped.
+A no-match is now **terminal**: the action ends and the lock screen starts a
+fresh verify. `operation_prepare` is back to restoring only the sensor power
+that `open()` deliberately dropped.
 
-```diff
-+      if (self->match_retries < EL721_MATCH_RETRIES)
-+        {
-+          GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
-+          ...
-+          el721_complete_match_retry (FP_DEVICE (self), current, retry);
+What remains is a retry for the case the TA *does* flag — `BAD_QUALITY`:
+
+```c
+if (reply.result == 39 || reply.result == 41)
+  {
+    GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
+    ...
+    action_cleanup (self);
+    el721_complete_match_retry (FP_DEVICE (self), current, retry);
+  }
 ```
 
-and, because fprintd restarts **without claiming the device again**, the QTEE
-session survives — and the TA's matcher answers once per identity per session,
-repeating that answer for every later capture in the same session. Measured: 21
-captures from one press inside one session returned one identical reply and none
-matched, while the same finger matched across separate sessions. So
-`operation_prepare` closes the session and opens a new one per action:
+libfprint permits exactly **one** result per action, retries included, so the
+retry has to clean up first and let fprintd start the next action; rearming here
+left `result_reported` set and made the next physical contact violate that
+contract. Enrolment reports the same retry through `fpi_device_enroll_progress`,
+which is what a marginal fingertip needs — one measured 17-stage run took 55
+samples.
 
-```diff
--  /* ... only restore the sensor power that open() deliberately dropped. */
--  return set_sensor_power (self, TRUE, error);
-+  if (!set_sensor_power (self, TRUE, error))
-+    return FALSE;
-+  el721_qtee_close (self->qtee);
-+  self->qtee = el721_qtee_open (EL721_FIRMWARE, error);
-+  if (!self->qtee || !el721_qtee_prepare (self->qtee, error))
-+    return FALSE;
-```
-
-Verified: 10 attempts in one action produced 9 retries, 9 session rebuilds and
-9 fresh actions. The retry budget (`EL721_MATCH_RETRIES`, 9) is the driver's,
-because fprintd has no retry limit of its own.
-
-### 6. `libfprint/drivers/el721.c` — keep HBM lit for the whole action
+### 6. `libfprint/drivers/el721.c` — hold the light across a press, drop it per sample
 
 HBM on this DDIC is a **global** panel change, not a spot: entering FOD mode
-moves DCS `0x51` from the user's brightness to the FOD level (420 → 634 cd/m²,
-`ANA38407_FOD_BRIGHTNESS` 1623), and the GNOME Shell overlay compensates with a
+moves DCS `0x51` from the user's brightness to the FOD level
+(`ANA38407_FOD_BRIGHTNESS` 1623), and the GNOME Shell overlay compensates with a
 black shade whose opacity is derived from the backlight ratio. That shade can
-only follow *after* the panel has already changed — the overlay polls
-`fod_mode` every 50 ms — so every HBM transition brightens the whole display for
-about three frames before the shade catches up.
+only follow *after* the panel has changed — the overlay polls `fod_mode` every
+50 ms — so every HBM transition brightens the whole display for about three
+frames before the shade catches up. Fewer transitions, fewer flashes.
 
-The driver used to cycle `fod_mode` 0 → 1 on **every attempt**: it dropped the
-light on an early release, after each enrolment capture, and in `udfps_end` on
-every retry restart. Because fprintd restarts a verify as a fresh action, one
-unlock needing 2–4 attempts produced 4–8 whole-display flashes. The light is now
-released only when the action really ends:
+Two rules, each measured against the alternative:
 
-```diff
--static void
--udfps_end (FpiDeviceEl721 *self)
-+static void
-+udfps_end (FpiDeviceEl721 *self, gboolean keep_light)
- {
-   if (!self->udfps_active)
-     return;
--  write_child (EL721_PANEL, "fod_mode", "0\n", NULL);
-+  if (!keep_light)
-+    {
-+      write_child (EL721_PANEL, "fod_mode", "0\n", NULL);
-+      self->udfps_lit = FALSE;
-+      g_unlink (EL721_VISUAL_STATE);
-+    }
-   write_child (EL721_TOUCH, "fod_enable", "0\n", NULL);
-```
+- **an early release keeps the light** (`touch-to-light held; finger released
+  early`). Dropping HBM and re-entering it on the next press is two flashes where
+  one would do, and the press is over by then anyway.
+- **an enrolment capture drops the light** — `fod_mode` goes 1 → 0 → 1 once per
+  sample. This is the opposite of what the retry-era code did, and it was
+  measured: holding HBM across a whole enrolment stalled coverage at 6 with 1–2
+  of 17 stages accepted over 55 samples, while cycling it per sample reached
+  coverage 100. It is also the operator's only cue that the reader took its
+  sample — the white circle going dark — which the user noticed the moment it
+  disappeared.
 
-The retry paths pass `TRUE` (`action_cleanup (self, TRUE)`), and the retry
-restart must not undo it — `udfps_begin` would otherwise re-arm "without HBM":
-
-```diff
--  if (!udfps_light (self, FALSE, error) || !udfps_publish (self, error))
-+  if (self->match_retries == 0 && !udfps_light (self, FALSE, error))
-```
-
-An early release now keeps the panel lit (`touch-to-light held; finger released
-early`) instead of dropping HBM and re-entering it on the next press, and an
-enrolment keeps it lit between samples — a fresh **PRESS edge** is still required
-per capture, so the light staying on cannot trigger one.
+An earlier version took a `keep_light` parameter through `udfps_end` so that
+retry restarts inside one action would not re-enter HBM. That went with §5: with
+no in-action retry, every action end really is an end, so `udfps_end` drops the
+light unconditionally again.
 
 The panel's own 15 s watchdog still applies: it returns the panel to normal
-brightness if the driver stops refreshing, which bounds a held light to the
-press timeout even if userspace dies.
-
-Verified on the tablet: a successful unlock that needed three attempts made
-exactly **2** HBM transitions (`fod_mode` 1 at the first press, 0 when the action
-ended) instead of the 6 it would have made while cycling per attempt, sampled at
-20 ms from `/sys/class/backlight/ae94000.dsi.0/fod_mode`.
+brightness if the driver stops refreshing, which bounds a held light even if
+userspace dies.
 
 ### 7. `libfprint/drivers/el721-identify-wire.h` — a press counts even if the finger was already down
 
@@ -402,12 +379,53 @@ what made an unlock fail. The rule no longer consults the latch:
 
 A finger that is merely *resting* emits no event at all, so `edge && pressed`
 still means exactly one capture per press edge — the guarantee the latch was
-there to protect. The cost is that a tap *outside* the sensor now also burns one
-retry, because this port's kernel trigger publishes a FOD press edge for any
-ordinary panel touch; gating that trigger by the sensor's `fod_rect` (the
-remedy deferred in the first version of the kernel driver) is what would remove
-that, and the driver still writes the reference device's rect rather than this
-board's.
+there to protect. The cost is that a tap *outside* the sensor also burned one
+retry, because this port's kernel trigger published a FOD press edge for any
+ordinary panel touch. That is now fixed by gating the trigger by the sensor
+window — see the next section.
+
+## The sensor window: a kernel-side filter, never a firmware one
+
+Consuming every contact while the prompt was armed had two measured
+consequences: the screen was dead to the user (a tap on "use password" did
+nothing), and every such tap burned a verify attempt and reported a no-match —
+**101 of 311 captures in one evening were nowhere near the sensor**, one of
+them at raw `x=325 y=1580`. The trigger now gates presses by the sensor window
+the libfprint driver publishes and hands everything else to input. Three
+properties make that safe.
+
+**The window is never forwarded to the controller.** The vendor driver writes
+it to the controller at sponge offset `0x4b`, and that write killed the reader
+once already: the controller then applies its own fingerprint handling inside
+the window, which it only reports through the low-power gesture scan it runs
+with the display *off*, so the ordinary coordinate channel carrying the contact
+goes silent. Measured with a valid window written, the driver armed at
+02:26:32 and logged **no contact at all for the next 28 s** while the finger
+pressed the sensor. `fod_rect_store()` therefore stores the window and never
+touches the i2c bus — verified by disassembling the built module, where
+`fod_rect_store` calls only `sscanf` and `_dev_info`.
+
+**A window that cannot describe this panel filters nothing.** The reference
+port inherited the Tab S9 Ultra's `854 2732 994 2872` verbatim, whose y range
+2732-2872 starts past the bottom of this 1600x2560 panel; gating by it would
+silently reject every real press. An impossible window — all zero, inverted, or
+past `FTS_MAX_X`/`FTS_MAX_Y` — is treated as "no filter", which also makes the
+kernel and driver halves independently deployable: the module can be loaded
+while the old driver still publishes the Ultra window.
+
+**The window matches the reader.** `EL721_FOD_RECT` is `680 2240 920 2480`:
+the measured reader centre at portrait (800, 2360) with 120 px of margin around
+it for where a fingertip actually lands.
+
+Verified on the tablet 2026-09-24, with the trigger armed by a real lock-screen
+verify:
+
+| | measured |
+|---|---|
+| driver publishes the window | kernel logs `fingerprint FOD rect 680 2240 920 2480` |
+| an on-sensor press | `EL721 contact pressed=1 ... x=771 y=2355 capture=1` — inside the window, captured, `verify result=0 matched_slot=3` |
+| an off-sensor tap **while armed** | reaches input — `ABS_MT_POSITION_X=412 Y=283` appears in the event stream instead of being consumed |
+| the press itself | produces **no** input event, so there is no stray click under the circle |
 
 Verified on the tablet: three attempts produced **three** captures from three
 presses — one press each, with no discarded press and no lift-and-press — and

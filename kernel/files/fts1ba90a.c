@@ -47,7 +47,17 @@
 #define FTS_MODE_PRESS			BIT(4)
 
 #define FTS_CMD_SET_FOD_FINGER_MERGE	0x3b
-#define FTS_SPONGE_OFFSET_FOD_RECT	0x4b
+/*
+ * The vendor driver also forwards the sensor window to the controller, at
+ * sponge offset 0x4b. This port deliberately does not. Setting it makes the
+ * controller apply its own fingerprint handling inside that window, which it
+ * only reports through the low-power gesture scan it runs with the display
+ * off - so the ordinary coordinate channel carrying the contact goes silent
+ * and the reader stops working entirely. Measured with a valid window written:
+ * the driver armed at 02:26:32 and logged no contact at all for the next 28 s
+ * while the finger pressed the sensor. The window is a kernel-side filter
+ * only; see fod_rect_store().
+ */
 
 /*
  * A fingerprint contact arrives as a Samsung gesture frame with stype
@@ -453,6 +463,39 @@ static void fts1ba90a_report_fod(struct fts1ba90a *ts, const u8 *ev)
 }
 
 /*
+ * Is this contact inside the sensor window the driver published?
+ *
+ * With no window stored nothing can be classified, so do not gate: libfprint
+ * writes fod_rect before it arms the trigger, and a port that never writes one
+ * keeps the old behaviour of publishing every contact.
+ *
+ * A window that cannot describe this panel is treated the same way. The
+ * reference port inherited the Tab S9 Ultra's window (854 2732 994 2872),
+ * whose y range 2732-2872 starts past the bottom of this 1600x2560 panel;
+ * gating by it would silently reject every real press. An impossible window
+ * therefore filters nothing. That also makes the two halves of this change
+ * independent: a module with the gating can be loaded while the old libfprint
+ * still publishes the Ultra window, and the reader keeps working.
+ */
+static bool fts1ba90a_fod_in_rect(struct fts1ba90a *ts, unsigned int x,
+				  unsigned int y)
+{
+	u16 left = ts->fod_rect_data[0];
+	u16 top = ts->fod_rect_data[1];
+	u16 right = ts->fod_rect_data[2];
+	u16 bottom = ts->fod_rect_data[3];
+
+	if (!left && !top && !right && !bottom)
+		return true;
+	if (left > right || top > bottom)
+		return true;
+	if (right > FTS_MAX_X + 1 || bottom > FTS_MAX_Y + 1)
+		return true;
+
+	return x >= left && x <= right && y >= top && y <= bottom;
+}
+
+/*
  * The press edge that actually fires with the display on.
  *
  * Samsung reports a fingerprint press as a low-power gesture frame, but the
@@ -462,13 +505,21 @@ static void fts1ba90a_report_fod(struct fts1ba90a *ts, const u8 *ev)
  * for an entire 300 s libfprint action. The contact is still reported as an
  * ordinary coordinate event, so take the edge from there.
  *
- * The frame is consumed, never reported to input: while libfprint owns the
- * sensor the user is pressing the target, and forwarding that press would pop
- * up the desktop's long-press menu over the illuminated circle.
+ * Only a contact inside the published sensor window belongs to the reader.
+ * Everything else is an ordinary touch and is handed to input: consuming every
+ * contact while the prompt was armed left the screen dead - a tap on "use
+ * password" did nothing - and, once libfprint took any press edge as a
+ * capture, each such tap also burned a retry and reported a no-match
+ * (measured: 101 of 311 captures in one evening were nowhere near the sensor).
+ *
+ * A move inside the window opens a contact too. A finger already resting on
+ * the circle when the trigger arms emits no PRESS frame of its own, so the
+ * first coordinate frame it does emit is how the reader learns it is there;
+ * after that the contact is latched and further moves are just updates.
  */
 static bool fts1ba90a_fod_contact(struct fts1ba90a *ts, const u8 *ev)
 {
-	unsigned int action;
+	unsigned int action, x, y;
 
 	if (!ts->fod_enabled)
 		return false;
@@ -476,24 +527,42 @@ static bool fts1ba90a_fod_contact(struct fts1ba90a *ts, const u8 *ev)
 		return false;
 
 	action = ev[0] >> 6;
+	x = (ev[1] << 4) | (ev[3] >> 4);
+	y = (ev[2] << 4) | (ev[3] & 0xf);
+
 	switch (action) {
 	case FTS_ACTION_PRESS:
-		ts->fod_x = (ev[1] << 4) | (ev[3] >> 4);
-		ts->fod_y = (ev[2] << 4) | (ev[3] & 0xf);
+		if (!fts1ba90a_fod_in_rect(ts, x, y))
+			return false;
+		ts->fod_pressed = true;
+		ts->fod_sequence++;
+		break;
+	case FTS_ACTION_MOVE:
+		if (ts->fod_pressed)
+			return true;
+		if (!fts1ba90a_fod_in_rect(ts, x, y))
+			return false;
 		ts->fod_pressed = true;
 		ts->fod_sequence++;
 		break;
 	case FTS_ACTION_RELEASE:
+		/*
+		 * Release frames carry no coordinates, so ownership decides:
+		 * only the release of a contact this driver opened is ours. A
+		 * release we never took belongs to a touch input already has.
+		 */
 		if (!ts->fod_pressed)
-			break;
+			return false;
 		ts->fod_pressed = false;
 		ts->fod_sequence++;
 		break;
-	case FTS_ACTION_MOVE:
-		/* A move is not a new contact and must not read as one. */
-		break;
 	default:
 		return false;
+	}
+
+	if (action != FTS_ACTION_RELEASE) {
+		ts->fod_x = x;
+		ts->fod_y = y;
 	}
 
 	dev_dbg(&ts->client->dev, "fingerprint FOD contact %s at %u,%u (seq %u)\n",
@@ -817,6 +886,16 @@ static ssize_t fod_enable_store(struct device *dev,
 		return ret;
 
 	ts->fod_enabled = enable;
+	/*
+	 * Disarming drops the contact this driver was tracking: the release
+	 * frame either already passed or is dropped by the now-disabled trigger,
+	 * and a latch left set would make the next unrelated release look like
+	 * ours and be consumed, leaving a stuck touch in the UI.
+	 */
+	if (!enable && ts->fod_pressed) {
+		ts->fod_pressed = false;
+		ts->fod_sequence++;
+	}
 	dev_info(dev, "fingerprint FOD mode %s\n",
 		 enable ? "enabled" : "disabled");
 
@@ -825,9 +904,10 @@ static ssize_t fod_enable_store(struct device *dev,
 static DEVICE_ATTR_RW(fod_enable);
 
 /*
- * The libfprint driver tells the controller where the sensor sits (left top
- * right bottom, in panel coordinates) before it captures; the firmware uses it
- * to decide which contacts count as a fingerprint press.
+ * The libfprint driver tells the kernel where the sensor sits (left top right
+ * bottom, in panel coordinates) before it captures, and the kernel uses it to
+ * tell a fingerprint press from an ordinary tap. It is never forwarded to the
+ * controller; see the note where FTS_SPONGE_OFFSET_FOD_RECT used to be.
  */
 static ssize_t fod_rect_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
@@ -845,30 +925,12 @@ static ssize_t fod_rect_store(struct device *dev,
 {
 	struct fts1ba90a *ts = dev_get_drvdata(dev);
 	u16 rect[4];
-	u8 data[8];
-	unsigned int sum = 0;
-	int i, ret;
+	int ret;
 
 	ret = sscanf(buf, "%hu %hu %hu %hu", &rect[0], &rect[1], &rect[2],
 		     &rect[3]);
 	if (ret != 4)
 		return -EINVAL;
-
-	for (i = 0; i < 4; i++) {
-		data[i * 2] = rect[i] & 0xff;
-		data[i * 2 + 1] = (rect[i] >> 8) & 0xff;
-		sum += rect[i];
-	}
-
-	if (!sum)
-		return -EINVAL;
-
-	disable_irq(ts->client->irq);
-	ret = fts1ba90a_sponge_write(ts, FTS_SPONGE_OFFSET_FOD_RECT, data,
-				     sizeof(data));
-	enable_irq(ts->client->irq);
-	if (ret)
-		return ret;
 
 	memcpy(ts->fod_rect_data, rect, sizeof(rect));
 	dev_info(dev, "fingerprint FOD rect %u %u %u %u\n", rect[0], rect[1],
