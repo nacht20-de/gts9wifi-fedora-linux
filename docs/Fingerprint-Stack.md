@@ -477,3 +477,80 @@ The no-match scores are all near `0x8A...` (9070848, 9085184, 9087232, 9089280)
 while real matches scored 83538176 and 284854528 — so the score field is
 meaningless on a no-match, exactly as the vendored header warns. Never read a
 verdict from it; read `result` (0 = match, 32 = no-match) and `matched_slot`.
+
+## Enrolling from GNOME Settings: why the "Scan new fingerprint" tile did nothing
+
+On GNOME 50 (Fedora 44 ships `gnome-control-center` 50.4) pressing **Scan new
+fingerprint** in Settings did nothing at all: no error, no finger list, and no
+`EnrollStart` reaching fprintd. The failure is entirely in Settings' UI layer —
+the reader, fprintd, polkit and the port's driver are all fine, and
+`fprintd-enroll` worked the whole time.
+
+### What was actually happening
+
+Instrumenting the dialog (`patches/gnome-control-center-50.4-fingerprint-add-tile.patch`
+started life as this instrumentation) showed the popover being mapped and
+unmapped in the same instant:
+
+```
+FP-POPOVER add-finger popover MAPPED
+FP-POPOVER add-finger popover UNMAPPED
+```
+
+The "Scan new fingerprint" tile opens a `GtkPopover` holding one button per
+finger. Ten entries in a plain vertical box made the popover taller than the
+space available around the tile — the dialog is a bottom sheet 796x644 inside a
+1280x800 logical desktop, and the gallery sits at y 290-364 of it — so the
+compositor could not place the popup and dismissed it immediately. Because the
+popover never stayed mapped, clicking the tile looked like a dead button.
+
+The finger tiles in the same gallery worked because each of their popovers holds
+a single entry.
+
+### The fix
+
+`patches/gnome-control-center-50.4-fingerprint-add-tile.patch`, applied through
+`Patch0` in the package spec and built with `rpmbuild -bb`:
+
+* the popover's content is wrapped in a `GtkScrolledWindow` with
+  `max-content-height: 260` and `propagate-natural-height: true`, so the popover
+  is always small enough to be placeable;
+* `position: bottom` is dropped so GTK may flip the popover into view, as it
+  does for the finger tiles;
+* `autohide: false`, so the popover cannot be dismissed by the very click that
+  opened it, with `on_enroll_cb()` popping it down once a finger is chosen;
+* `on_print_activated_cb()` calls `gtk_popover_popup()` explicitly, so clicking
+  the tile body works and not only the small ⊕ icon.
+
+Upstream reached the same conclusion by redesign: GNOME 51 has no
+`add_print_popover` at all, replacing it with an `add_finger_button` and
+`AdwPreferencesGroup` finger rows on a separate page. This patch is the minimal
+backport of that idea to 50.4.
+
+### Building and installing it
+
+```sh
+sudo dnf builddep -y /home/fedora/rpmbuild/SPECS/gnome-control-center.spec
+dnf download --source gnome-control-center --enablerepo=fedora-source,updates-source
+rpm -i --define "_topdir $HOME/rpmbuild" gnome-control-center-50.4-1.fc44.src.rpm
+# add Patch0: gnome-control-center-50.4-fingerprint-add-tile.patch to the spec,
+# put the patch in ~/rpmbuild/SOURCES, then
+rpmbuild -bb ~/rpmbuild/SPECS/gnome-control-center.spec
+sudo rpm -Uvh --replacepkgs --replacefiles \
+  ~/rpmbuild/RPMS/aarch64/gnome-control-center-50.4-1.fc44.aarch64.rpm
+```
+
+The build takes about two minutes on the tablet (780 ninja targets, 8 cores).
+`%autosetup -p1` picks the patch up automatically. The original binary is kept
+at `/root/gnome-control-center.bak-orig`, and `dnf reinstall gnome-control-center`
+restores the packaged build — note that a Fedora update of the package will
+replace the patched binary and the tile will break again.
+
+### Verifying it
+
+The dialog's popover is invisible to `fprintd` and to the journal unless it is
+instrumented, and a GNOME Shell extension does not need a logout to be toggled.
+The quickest check is the one used here: launch Settings on the users panel,
+open the fingerprint dialog and click the tile — the finger list should drop
+down. Reading the AT-SPI tree is also a reliable way to see whether the popover
+actually mapped, since an unmapped popover contributes no accessible nodes.
