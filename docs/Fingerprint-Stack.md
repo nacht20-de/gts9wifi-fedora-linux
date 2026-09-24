@@ -728,14 +728,29 @@ RuntimeDirectoryMode=0755
 Verified by deleting the directory, restarting `fprintd`, and watching systemd
 recreate it with the `gts9u_fingerprint_runtime_t` label.
 
-### Settle status
+### Settle: 700 ms, measured on a healthy stack
 
-The verify settle is pinned to the port's validated 1200 ms by
-`/etc/systemd/system/fprintd.service.d/20-settle.conf`, while the compiled
-default is 700 ms (`EL721_LIGHT_SETTLE_VERIFY_US`). Keep that in mind when
-reading either value: the 700 ms speed result (press-to-match 1.20 s against
-1.69 s) is a real measurement, but the failure data gathered alongside it is
-**confounded** — several of those failures came from the poisoned secure state
-described above, not from the settle. Re-measuring 700 ms is worthwhile now that
-the stack is healthy; delete the drop-in or set
-`EL721_LIGHT_SETTLE_VERIFY_MS=700` and compare the match rate.
+The verify settle is 700 ms, both as the library default
+(`EL721_LIGHT_SETTLE_VERIFY_US`) and as the explicit pin in
+`/etc/systemd/system/fprintd.service.d/20-settle.conf` — the pin is kept so the
+value is visible and changeable without a rebuild.
+
+Measured over six consecutive lock-screen unlocks on a healthy stack:
+
+| | 700 ms | 1200 ms |
+| --- | --- | --- |
+| press -> frame taken | 0.73 s | 1.22 s |
+| frame taken -> match | 0.54 s | 0.57 s |
+| **press -> match** | **1.27-1.35 s** | **1.79 s** |
+| outcome | 6/6 matched, every one on a single `87` iteration, scores ~83.6M | 1/1 matched |
+
+The failures seen earlier at 700 ms — and at 1200 ms — were the poisoned secure
+state described above, not the settle: once the boot ordering is right, every
+press matched on the first frame. The earlier "the shorter settle is not costing
+matches" reading happened to be correct, but for the wrong reason, and the
+faster value is now backed by a clean measurement rather than a confounded one.
+
+A useful side effect of the numbers: the settle sets the minimum press length,
+because a release before the deadline aborts the capture with `held; finger
+released early` and the driver then waits for a fresh contact. At 1200 ms a
+one-second tap captured nothing; at 700 ms it captures on the first try.
