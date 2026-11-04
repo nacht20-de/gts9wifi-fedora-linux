@@ -130,13 +130,35 @@ CONFIG_TOUCHSCREEN_FTS1BA90A=y
 CONFIG_TOUCHSCREEN_WACOM_WEZ01=y
 
 # Persist the early console across a warm reset.  The board-specific LOGM
-# console is readable by Samsung recovery through /proc/last_kmsg; retain the
-# generic pstore core for later backends as well.
+# console is readable by Samsung recovery through /proc/last_kmsg.  The
+# ramoops node in the DTS gives pstore a RAM backend in the sec_pmsg range,
+# so oops/panic dumps, the console, pmsg and (when switched on) the function
+# trace come back under /sys/fs/pstore after the reset.
 CONFIG_SAMSUNG_GTS9WIFI_SEC_LOG=y
 CONFIG_PSTORE=y
 CONFIG_PSTORE_RAM=y
 CONFIG_PSTORE_CONSOLE=y
 CONFIG_PSTORE_PMSG=y
+CONFIG_PSTORE_FTRACE=y
+
+# Turn a silent hang into a panic that ramoops records.  There is no usable
+# hardware watchdog (no Gunyah watchdog behind SMCCC, no APSS watchdog node),
+# so this relies on the soft/hard (buddy) lockup detectors.  Samsung ABL
+# appends nowatchdog, which disables both at boot; the rootfs turns them back
+# on and sets the panic policy in sysctl.d/60-gts9wifi-hang-panic.conf.  The
+# hung-task detector only warns.  DETECT_HUNG_TASK changes task_struct, so the
+# modules must come from the same build (the RPM keeps them together).
+CONFIG_SOFTLOCKUP_DETECTOR=y
+CONFIG_HARDLOCKUP_DETECTOR=y
+CONFIG_DETECT_HUNG_TASK=y
+
+# kdump.  Every reset decays the ramoops range, so a panic kexecs into a crash
+# kernel instead (crashkernel= in boot/cmdline.txt) and kdump-utils saves the
+# panicked kernel's dmesg to /var/crash before rebooting.  The base config
+# already has these; listed so the kdump setup does not depend on it.
+CONFIG_KEXEC_FILE=y
+CONFIG_CRASH_DUMP=y
+CONFIG_PROC_VMCORE=y
 
 # Adreno 740 GPU bring-up.  gpucc built-in gives the GPU SMMU (3da0000) and the
 # GMU their clocks so they stop failing probe with -110.  drm/msm is built-in

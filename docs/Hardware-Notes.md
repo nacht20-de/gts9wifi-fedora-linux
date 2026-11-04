@@ -488,6 +488,161 @@ and docks work.
 
 ---
 
+## Kernel logs after a crash
+
+Two mechanisms, for two kinds of failure:
+
+- **A panic** (an oops, `sysrq-c`, or a hang the sysctls below turn into a
+  panic) kexecs into a crash kernel. The crash kernel saves the panicked
+  kernel's log to `/var/crash/<dir>/vmcore-dmesg.txt` and reboots. DRAM is
+  never reset on that path, so the log comes back complete.
+- **A wedge that never panics** leaves only the ramoops console record, which
+  survives a hard restart partly garbled.
+
+### kdump
+
+| Item | Value |
+|---|---|
+| Reservation | `crashkernel=288M` in `boot/cmdline.txt` (vendor_boot cmdline), placed at `0xe8e00000` |
+| Crash kernel | the installed kernel itself (`/boot/vmlinuz-$(uname -r)`), loaded by `kdump.service` with `kexec -s -p` |
+| Initramfs | `/var/lib/kdump/initramfs-<kver>kdump.img`, about 18 MiB (46 MiB unpacked), rebuilt by `kdumpctl` when the config or kernel changes |
+| Config | `/etc/kdump.conf`, `/etc/sysconfig/kdump` (overlay) |
+| Output | `/var/crash/127.0.0.1-<date>/vmcore-dmesg.txt`, plus `kexec-dmesg.log` (the crash kernel's own log) |
+| Time to reboot | about 70 s from the panic |
+
+`cat /sys/kernel/kexec_crash_loaded` prints 1 when a crash kernel is armed.
+
+Measured with `echo c | sudo tee /proc/sysrq-trigger` and the amplifiers
+bound: "Starting crashdump kernel" is printed 0.12 s after the panic. The
+tablet is back about 70 s later with a complete `vmcore-dmesg.txt` (1585 lines,
+no damaged characters, panic message and call trace intact).
+
+Samsung's uH holds EL2, but it does not get in the way: the kernel runs at
+EL1, PSCI `CPU_OFF` and `CPU_ON` work, and kexec's jump into the new kernel
+with the MMU off goes through.
+
+Things the port had to change:
+
+- `genirq/kexec` patch (`kernel/patches/kexec-skip-bus-locked-irqchips.patch`).
+  Before it jumps, the panicking kernel calls `irq_set_irqchip_state()` on
+  every interrupt, and that call takes the chip's bus lock. The four CS35L45
+  amplifiers are regmap-irq chips on I2C (48 interrupts). Unlocking them writes
+  over I2C, which runtime-resumes the GENI controller. That votes interconnect
+  bandwidth through RPMh and waits for an RPMh interrupt that never comes once
+  the other CPUs are stopped. Every write timed out after 10 s, and the tablet
+  sat on a frozen screen until a hard restart. The patch skips the call for
+  chips that need a bus lock.
+- Crash-kernel cmdline. `/proc/cmdline` carries ABL's Samsung parameters
+  twice. With kdump's additions it ran past arm64's 2048-byte
+  `COMMAND_LINE_SIZE` and cut off `nr_cpus=1`, `reset_devices` and the rest.
+  `/etc/sysconfig/kdump` therefore sets a short `KDUMP_COMMANDLINE` of its own.
+  `initcall_blacklist=msm_drm_register` keeps the display and GPU from being
+  re-initialised; the panel keeps its last frame.
+- Crash initramfs. With dracut's squashfs root, the crash kernel's init died
+  right after `switch_root` ("Attempted to kill init! exitcode=0x7d00").
+  `kdump.conf` omits the squash modules, so the initramfs is a plain cpio.
+  It also omits FIPS, TPM, i18n, the USB-network module, the extra kernel
+  modules and xfs/btrfs. That shrinks the image the reservation has to hold
+  from 28 to 18 MiB.
+
+Limits:
+
+- No `vmcore`. makedumpfile 1.7.9, the Fedora 44 package, cannot walk this
+  kernel's page tables (`ARM64_VA_BITS=52` with 4K pages). Support landed
+  upstream after that release (makedumpfile b7587f1e8f45, "arm64: Add 5-level
+  page table support for 4K pages with 52-bit VA"). Until then kdump logs
+  `saving vmcore failed` and reboots; `vmcore-dmesg.txt` is saved before that
+  step and is not affected.
+- The crash kernel has no wall clock, so the directory name and file times
+  say 1970. The timestamps inside `vmcore-dmesg.txt` count from the panicked
+  kernel's boot.
+- The reservation costs 288 MiB of RAM. That size is measured: at the end of
+  a dump the crash kernel has used about 220 MiB, of which the kernel image is
+  about 58 MiB, tmpfs (initramfs plus `/run`) 54 MiB and slab 50 MiB. 288M
+  leaves 68 MiB free. `kdumpctl estimate` suggests 320M, but that figure is
+  its generic default. arm64 has no `crashkernel=…,cma` in 7.2 (only x86 and
+  powerpc reserve one), so the reservation cannot be lent back to the running
+  system.
+- Only the crash path works. A plain `kexec -e` or `systemctl kexec` oopses in
+  `machine_kexec+0x114` (translation fault, ESR 0x96000007) while it sets up
+  the relocation, and systemd falls back to a firmware reboot. A crash kexec
+  needs no relocation, because its segments are loaded straight into the
+  reservation.
+
+### ramoops
+
+A ramoops region gives pstore a RAM backend, so the console up to a hang is
+still there on the next boot.
+
+| Item | Value |
+|---|---|
+| Region | `ramoops@880900000`, 2 MiB, Samsung's former `sec_pmsg` range |
+| Layout | 4 × 256 KiB dmesg, 512 KiB console, 256 KiB pmsg, 256 KiB ftrace (per CPU); `ecc-size` 96 leaves about 57% of each zone for data |
+| While booted | `/sys/fs/pstore` (root only) |
+| Archived | `/var/lib/systemd/pstore/`, moved there by `systemd-pstore.service` early in the next boot |
+
+The files:
+
+- `dmesg-ramoops-N` — the kernel log at an oops or a panic.
+- `console-ramoops-0` — what the previous boot printed to the consoles, up to
+  the reset. It is all a hang that never panics leaves behind, and it only
+  holds lines at or above the console loglevel. Plymouth leaves that at 1, so
+  `gts9wifi-console-loglevel.service` sets it back to 7 once Plymouth has quit.
+- `pmsg-ramoops-0` — whatever userspace wrote to `/dev/pmsg0`
+  (`echo note | sudo tee /dev/pmsg0`), for breadcrumbs from scripts.
+- `ftrace-ramoops-0` — the last functions each CPU ran. Off by default because
+  it slows everything down; switch it on before reproducing a hang with
+  `echo 1 | sudo tee /sys/kernel/debug/pstore/record_ftrace`.
+
+Each file ends with an `ECC: N Corrected bytes, M unrecoverable blocks` line
+that says how much of it survived. The first boot with the region logs a burst
+of `ramoops: uncorrectable error in header`, because the range held ordinary
+RAM before; later boots log the same after the RAM lost power.
+
+To get a record at all, a hang has to become a panic.
+`/usr/lib/sysctl.d/60-gts9wifi-hang-panic.conf` panics on an RCU stall (21 s),
+and also on a soft or hard lockup when the kernel is built with the lockup
+detectors (ABL appends `nowatchdog`, so the file switches them back on).
+The panic then goes to kdump; with no crash kernel loaded, `panic=10` reboots.
+The firmware exposes no usable hardware watchdog:
+there is no Gunyah watchdog, and the DT has no APSS watchdog node. A wedge that
+stops every CPU therefore only shows up in the console record.
+
+Every reset seen so far flips a large share of the bits in the region, so
+records come back partly garbled. The flips are scattered single-bit errors,
+which looks like DRAM losing refresh during the reset; the bootloader does not
+seem to overwrite the range. ECC repairs a block only while it has few enough
+bad bytes, and leaves the rest as raw, garbled text. The kernel discards a
+dmesg record whose first line or deflate stream is damaged, so the panic dump
+itself has not survived any reset yet. The console record does survive, and
+the panic message and call trace in it stay readable through the typos.
+
+| Reset | ECC | Result |
+|---|---|---|
+| Panic → PSCI `SYSTEM_RESET` (`echo c > /proc/sysrq-trigger`) | 16 | console and pmsg back, every console block unrecoverable; no dmesg |
+| Clean `systemctl reboot` (also `SYSTEM_RESET`) | 16 | console back, every block unrecoverable |
+| Panic with `/sys/kernel/reboot/mode` = `warm` | 16 | `SYSTEM_RESET2` fails ("Reboot failed -- System halted"), and the tablet stays halted until a hard restart; do not use `reboot=warm` |
+| Panic → `SYSTEM_RESET` | 96 | pmsg back intact; console 611 of ~630 blocks unrecoverable; zone headers repaired with 20–31 bad bytes each; no dmesg |
+| Long power-off, or the forced reset after the Nov 2 hang | 16 | nothing, every header unrecoverable |
+| Hard restart (Power + Volume Down) about 1 min after a hang | 96 | pmsg intact; console 105 unrecoverable blocks, call traces readable |
+
+A clean ramoops record would need a reset that keeps DRAM in self-refresh, and
+the firmware offers none:
+
+- PSCI `SYSTEM_RESET2` with the architectural warm type is rejected (see the
+  table).
+- A PMIC warm reset is set up through the PS_HOLD reset type in PMK8550
+  `PON_PBS` (0x800). The registers read fine from Linux (for example
+  0x852/0x853 = 0x01/0x80). Mainline has no write path for them, though, and
+  Qualcomm TZ programs the PS_HOLD reset type itself inside its PSCI reset
+  handler, so anything Linux wrote would be overwritten.
+- The vendor `SYSTEM_RESET2` types Samsung uses lead to upload or download
+  mode, which this port avoids.
+
+kdump sidesteps the reset entirely, which is why it is the panic path.
+
+---
+
 ## Cross-cutting notes
 
 - Everything built `=y` needs a rebuild and a `boot.img` flash; anything that

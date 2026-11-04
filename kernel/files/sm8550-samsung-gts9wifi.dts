@@ -123,8 +123,29 @@
 			no-map;
 		};
 
-		sec_pmsg_mem: sec-pmsg@880900000 {
+		/*
+		 * pstore/ramoops in Samsung's sec_pmsg range.  The stock kernel
+		 * keeps its pstore pmsg ring here for last_pmsg, so the boot chain
+		 * leaves it intact across a warm reset, next to sec_log_buf.  The
+		 * records come back under /sys/fs/pstore and systemd-pstore moves
+		 * them to /var/lib/systemd/pstore.  Layout: four 256 KiB dmesg
+		 * records (oops and panic), 512 KiB console, 256 KiB pmsg and
+		 * 256 KiB ftrace split per CPU.  Every reset on this board,
+		 * including a clean reboot, flips a large share of the bits in
+		 * this range.  ecc-size 96 (up to 48 bad bytes repaired per 128)
+		 * costs about 43% of each zone, but keeps the zone headers
+		 * readable where 16 lost them.
+		 */
+		ramoops@880900000 {
+			compatible = "ramoops";
 			reg = <0x8 0x80900000 0x0 0x200000>;
+			record-size = <0x40000>;
+			console-size = <0x80000>;
+			ftrace-size = <0x40000>;
+			pmsg-size = <0x40000>;
+			max-reason = <2>;	/* KMSG_DUMP_OOPS */
+			flags = <0x1>;		/* RAMOOPS_FLAG_FTRACE_PER_CPU */
+			ecc-size = <96>;
 			no-map;
 		};
 
