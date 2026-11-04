@@ -1,0 +1,17 @@
+[Unit]
+Description=Restore the kernel console loglevel after Plymouth
+# Plymouth (libply) mutes the kernel console while it shows the splash, and on
+# this port the console loglevel is still 1 after plymouthd has exited, for the
+# whole session.  The ramoops console record (docs/Hardware-Notes.md, "Kernel
+# logs after a crash") only keeps what reaches a console, so at 1 a hang that
+# never panics leaves nothing to read.  Put it back to the loglevel=7 that the
+# command line asks for.  The cost is the serial console printing KERN_INFO
+# lines at 115200 baud again, as it already does during early boot.
+After=plymouth-quit.service plymouth-quit-wait.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/dmesg --console-level 7
+
+[Install]
+WantedBy=multi-user.target

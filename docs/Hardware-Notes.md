@@ -488,6 +488,53 @@ and docks work.
 
 ---
 
+## Kernel logs after a crash
+
+A ramoops region gives pstore a RAM backend, so the kernel log of a panic, or
+the console up to a hang, is still there on the next boot.
+
+| Item | Value |
+|---|---|
+| Region | `ramoops@880900000`, 2 MiB, Samsung's former `sec_pmsg` range |
+| Layout | 4 × 256 KiB dmesg, 512 KiB console, 256 KiB pmsg, 256 KiB ftrace (per CPU), ECC on |
+| While booted | `/sys/fs/pstore` (root only) |
+| Archived | `/var/lib/systemd/pstore/`, moved there by `systemd-pstore.service` early in the next boot |
+
+The files:
+
+- `dmesg-ramoops-N` — the kernel log at an oops or a panic.
+- `console-ramoops-0` — what the previous boot printed to the consoles, up to
+  the reset. It is all a hang that never panics leaves behind, and it only
+  holds lines at or above the console loglevel. Plymouth leaves that at 1, so
+  `gts9wifi-console-loglevel.service` sets it back to 7 once Plymouth has quit.
+- `pmsg-ramoops-0` — whatever userspace wrote to `/dev/pmsg0`
+  (`echo note | sudo tee /dev/pmsg0`), for breadcrumbs from scripts.
+- `ftrace-ramoops-0` — the last functions each CPU ran. Off by default because
+  it slows everything down; switch it on before reproducing a hang with
+  `echo 1 | sudo tee /sys/kernel/debug/pstore/record_ftrace`.
+
+Each file ends with an `ECC: N Corrected bytes, M unrecoverable blocks` line
+that says how much of it survived. The first boot with the region logs a burst
+of `ramoops: uncorrectable error in header`, because the range held ordinary
+RAM before; later boots log the same after the RAM lost power.
+
+To get a record at all, a hang has to become a panic.
+`/usr/lib/sysctl.d/60-gts9wifi-hang-panic.conf` panics on an RCU stall (21 s),
+and also on a soft or hard lockup when the kernel is built with the lockup
+detectors (ABL appends `nowatchdog`, so the file switches them back on).
+`panic=10` then reboots. The firmware exposes no usable hardware watchdog:
+there is no Gunyah watchdog, and the DT has no APSS watchdog node. A wedge that
+stops every CPU therefore only shows up in the console record.
+
+How much survives depends on how the tablet resets:
+
+| Reset | Result |
+|---|---|
+| Panic → PSCI `SYSTEM_RESET` (`echo c > /proc/sysrq-trigger`) | console and pmsg back, with scattered bit flips; the dmesg record's header did not survive |
+| Long power-off, or the forced reset after the Nov 2 hang | nothing, every header unrecoverable |
+
+---
+
 ## Cross-cutting notes
 
 - Everything built `=y` needs a rebuild and a `boot.img` flash; anything that

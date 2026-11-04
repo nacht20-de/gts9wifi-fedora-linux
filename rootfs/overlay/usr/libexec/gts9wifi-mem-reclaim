@@ -57,11 +57,12 @@ REGIONS = [
     'ipa-gsi-region@9b090000',                  #   0.0M
     'spu-modem-shared-region@9b2e0000',         #   0.1M
     # Samsung downstream debug/ramdump: no DT consumer, no mainline driver.
-    # sec-log is kept, the sec-kernel-log node is enabled.
+    # sec-log is kept, the sec-kernel-log node is enabled.  The old sec-pmsg
+    # range is the ramoops@880900000 node now and is kept as well.
     'sec-qcom-rdx@880c00000',                   # 173.0M
     'sec-debug-bl@880400000',                   #   5.0M
     'sec-xbl-ramdump@a7d00000',                 #   3.0M
-    'sec-pmsg@880900000',                       #   2.0M
+    'sec-pmsg@880900000',                       #   2.0M, pre-ramoops DTBs
     'sec-debug-pool@880100000',                 #   1.0M
     'sec-reset-info@8801ff000',
     'google-debug-kinfo@880b00000',
