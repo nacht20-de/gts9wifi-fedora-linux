@@ -1,0 +1,69 @@
+# Kernel Version string for the -kdump kernel, such as 2.6.13-1544.FC5kdump
+# If no version is specified, then the init script will try to find a
+# kdump kernel with the same version number as the running kernel.
+KDUMP_KERNELVER=""
+
+# The kdump commandline is the command line that needs to be passed off to
+# the kdump kernel.  This will likely match the contents of the grub kernel
+# line.  For example:
+#   KDUMP_COMMANDLINE="ro root=LABEL=/"
+# Dracut depends on proper root= options, so please make sure that appropriate
+# root= options are copied from /proc/cmdline. In general it is best to append
+# command line options using "KDUMP_COMMANDLINE_APPEND=".
+# If a command line is not specified, the default will be taken from
+# /proc/cmdline
+# gts9wifi: /proc/cmdline carries ABL's Samsung parameters twice, and with the
+# kdump additions it runs past arm64's 2048-byte COMMAND_LINE_SIZE, which cut
+# off nr_cpus=1 and the rest.  Pass only what the crash kernel needs.
+KDUMP_COMMANDLINE="console=tty0 console=ttyMSM0,115200n8 ignore_console_null earlycon loglevel=7 clk_ignore_unused pd_ignore_unused regulator_ignore_unused nokaslr"
+
+# This variable lets us remove arguments from the current kdump commandline
+# as taken from either KDUMP_COMMANDLINE above, or from /proc/cmdline
+# NOTE: some arguments such as crashkernel will always be removed
+KDUMP_COMMANDLINE_REMOVE="hugepages hugepagesz slub_debug quiet log_buf_len swiotlb hugetlb_cma ignition.firstboot cma"
+
+# This variable lets us append arguments to the current kdump commandline
+# after processed by KDUMP_COMMANDLINE_REMOVE
+# gts9wifi: initcall_blacklist keeps msm DRM from re-initialising the display
+# and GPU in the crash kernel; the panel keeps its last frame.
+KDUMP_COMMANDLINE_APPEND="novmcoredd hugetlb_cma=0 kfence.sample_interval=0 initramfs_options=size=90% irqpoll nr_cpus=1 reset_devices cgroup_disable=memory udev.children-max=2 panic=10 swiotlb=noforce cma=0 initcall_blacklist=msm_drm_register"
+
+# This variable lets us append arguments to fadump (powerpc) capture kernel,
+# further to the parameters passed via the bootloader.
+FADUMP_COMMANDLINE_APPEND=""
+
+# Any additional kexec arguments required.  In most situations, this should
+# be left empty
+#
+# Example:
+#   KEXEC_ARGS="--elf32-core-headers"
+KEXEC_ARGS="-s"
+
+#Where to find the boot image
+#KDUMP_BOOTDIR="/boot"
+
+#What is the image type used for kdump
+KDUMP_IMG="vmlinuz"
+
+#What is the images extension.  Relocatable kernels don't have one
+KDUMP_IMG_EXT=""
+
+# Enable vmcore creation notification by default, disable by setting
+# VMCORE_CREATION_NOTIFICATION=""
+VMCORE_CREATION_NOTIFICATION="yes"
+
+# Logging is controlled by following variables in the first kernel:
+#   - @var KDUMP_STDLOGLVL - logging level to standard error (console output)
+#   - @var KDUMP_SYSLOGLVL - logging level to syslog (by logger command)
+#   - @var KDUMP_KMSGLOGLVL - logging level to /dev/kmsg (only for boot-time)
+#
+# In the second kernel, kdump will use the rd.kdumploglvl option to set the
+# log level in the above KDUMP_COMMANDLINE_APPEND.
+#   - @var rd.kdumploglvl - logging level to syslog (by logger command)
+#   - for example: add the rd.kdumploglvl=3 option to KDUMP_COMMANDLINE_APPEND
+#
+# Logging levels: no logging(0), error(1),warn(2),info(3),debug(4)
+#
+# KDUMP_STDLOGLVL=3
+# KDUMP_SYSLOGLVL=0
+# KDUMP_KMSGLOGLVL=0

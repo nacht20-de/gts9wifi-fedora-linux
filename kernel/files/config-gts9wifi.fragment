@@ -152,6 +152,14 @@ CONFIG_SOFTLOCKUP_DETECTOR=y
 CONFIG_HARDLOCKUP_DETECTOR=y
 CONFIG_DETECT_HUNG_TASK=y
 
+# kdump.  Every reset decays the ramoops range, so a panic kexecs into a crash
+# kernel instead (crashkernel= in boot/cmdline.txt) and kdump-utils saves the
+# panicked kernel's dmesg to /var/crash before rebooting.  The base config
+# already has these; listed so the kdump setup does not depend on it.
+CONFIG_KEXEC_FILE=y
+CONFIG_CRASH_DUMP=y
+CONFIG_PROC_VMCORE=y
+
 # Adreno 740 GPU bring-up.  gpucc built-in gives the GPU SMMU (3da0000) and the
 # GMU their clocks so they stop failing probe with -110.  drm/msm is built-in
 # (=y): its DRM helper deps - drm_exec/gpuvm/sched/buddy/display_helper - are

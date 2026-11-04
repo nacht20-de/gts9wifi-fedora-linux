@@ -67,7 +67,8 @@ dnf -y --installroot="$rootfs" --releasever="$fedora_release" \
     libqmi libqrtr-glib protobuf-c libmbim \
     systemd-pam \
     atheros-firmware qcom-firmware \
-    e2fsprogs kmod
+    e2fsprogs kmod \
+    kexec-tools kdump-utils makedumpfile
 
 if [ "$desktop" = "gnome" ]; then
     echo ">>> Installing the GNOME Workstation environment"
@@ -415,7 +416,7 @@ for unit in \
     pd-mapper \
     gts9wifi-wait-sensor-proxy \
     gts9wifi-bt-provision bluetooth gts9wifi-mem-reclaim \
-    gts9wifi-console-loglevel \
+    gts9wifi-console-loglevel kdump \
     gts9wifi-adsp-boot \
     gts9wifi-panel-coldboot-recover \
     gts9wifi-grow-rootfs \

@@ -1,0 +1,41 @@
+From: SM-X710 postmarketOS port <gts9wifi@example.com>
+Date: Wed, 4 Nov 2026 23:00:00 +0300
+Subject: [PATCH] genirq/kexec: don't take a slow-bus chip's bus lock on crash
+
+machine_kexec_mask_interrupts() calls irq_set_irqchip_state() on every
+started interrupt to clear a VM-forwarded active state.  That call takes the
+chip's bus lock.  For a regmap-irq chip behind I2C, the unlock half
+(regmap_irq_sync_unlock) writes the mask registers over the bus.
+
+On the SM-X710 the four CS35L45 speaker amplifiers expose 48 such interrupts.
+In a crash kexec the I2C write runtime-resumes the GENI controller, which
+votes interconnect bandwidth through RPMh and waits for an RPMh completion
+interrupt.  That interrupt never arrives with the other CPUs stopped and
+interrupts disabled, so every write times out after 10 s and the panicking
+kernel never reaches the crash kernel.
+
+A chip that needs a bus lock is never one that forwards interrupts to a VM,
+so skip the call for it.  irq_shutdown() still runs and only updates the
+chip's cached mask, which is what the bus lock would have flushed.
+
+Signed-off-by: SM-X710 postmarketOS port <gts9wifi@example.com>
+---
+--- a/kernel/irq/kexec.c
++++ b/kernel/irq/kexec.c
+@@ -20,7 +20,15 @@
+ 		if (!chip || !irqd_is_started(&desc->irq_data))
+ 			continue;
+ 
+-		if (IS_ENABLED(CONFIG_GENERIC_IRQ_KEXEC_CLEAR_VM_FORWARD)) {
++		/*
++		 * irq_set_irqchip_state() takes the chip's bus lock.  On a chip
++		 * behind a slow bus (regmap-irq over I2C/SPI) that is a mutex
++		 * and a bus transfer, which cannot complete here: the other CPUs
++		 * are stopped and interrupts are off, so a crash kexec hangs.
++		 * Such a chip is never forwarded to a VM, so skip the call.
++		 */
++		if (IS_ENABLED(CONFIG_GENERIC_IRQ_KEXEC_CLEAR_VM_FORWARD) &&
++		    !chip->irq_bus_lock && !chip->irq_bus_sync_unlock) {
+ 			/*
+ 			 * First try to remove the active state from an interrupt which is forwarded
+ 			 * to a VM. If the interrupt is not forwarded, try to EOI the interrupt.
