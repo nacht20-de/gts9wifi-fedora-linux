@@ -531,7 +531,12 @@ How much survives depends on how the tablet resets:
 | Reset | Result |
 |---|---|
 | Panic → PSCI `SYSTEM_RESET` (`echo c > /proc/sysrq-trigger`) | console and pmsg back, with scattered bit flips; the dmesg record's header did not survive |
+| Panic with `/sys/kernel/reboot/mode` = `warm` | `SYSTEM_RESET2` fails ("Reboot failed -- System halted") and the tablet stays halted until a hard restart, which flips even more bits; do not use `reboot=warm` |
 | Long power-off, or the forced reset after the Nov 2 hang | nothing, every header unrecoverable |
+
+The flips look like DRAM losing refresh during the reset, not like the
+bootloader overwriting the region. Each 128-byte ECC block can only repair 8
+bad bytes, so many blocks stay unreadable.
 
 ---
 
