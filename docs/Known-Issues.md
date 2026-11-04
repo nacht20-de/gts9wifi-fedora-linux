@@ -20,7 +20,7 @@ reused, and a retired number is simply absent rather than reassigned
 | 11 | libcamera had no sensor helper, so max gain | fixed — helper added, AGC runs |
 | 13 | Charging bypass on 25 W+ chargers | planned — needs a `gnome-control-center` patch |
 | 14 | Double tap to turn on the screen | fixed — with a GNOME extension UI |
-| 15 | Under-display fingerprint sensor (EgisTec EL721) | in progress — blocked at the TEE's `KEYMASTER_NOT_CONFIGURED` |
+| 15 | Under-display fingerprint sensor (EgisTec EL721) | working — enrolled and verified through libfprint/fprintd; single-shot verify is ~20% |
 | 16 | Hardware video decode (iris / VPU 3.0) | fixed — the VPU decodes; application support is partial |
 | 17 | Speaker volume capped (~−19 dB) | fixed — Cirrus speaker-protection DSP firmware now loads |
 | 18 | `/`, `/etc`, `/usr` owned by the image build user | fixed — this had silently disabled *every* `tmpfiles.d` entry |
@@ -78,10 +78,69 @@ The Linux half and the whole secure processor are up on the tablet:
   userspace peers — `SP Apps were loaded successfully`, `SP Build v73.6`,
   remoteproc `running`.
 
-The session still stops at the TEE's `KEYMASTER_NOT_CONFIGURED` (cache status
-`9936`). What remains is the secure owner that configures `sp_keymaster` and
-restores HwVault credential 11, then the panel `cell_id` / HBM handling and a
-libfprint backend.
+The secure world is done: StrongBox keymaster is configured, the boot-only
+secure owner prints `SECURE_READY`, and the trustlet reaches a calibrated
+`Prepare`. Panel HBM and the module `cell_id` landed in the same round, so the
+sensor's illumination interface (`fod_mode`, `fod_circle`, `fod_brightness`,
+`fod_ready`) exists.
+
+The capture path now works end to end. A finger enrolled through the real
+libfprint/fprintd stack on 2026-09-24 — all 17 of 17 `EL721_ENROLL_STAGES`
+accepted, coverage climbing to 100, template under
+`/var/lib/fprint/fedora/el721/gts9u-el721/` — and then verified
+(`verify-match`, `matched_slot=3`, score 284854528).
+
+Four things had to be fixed, and the earlier reading of the failure was wrong in
+two places:
+
+- **The latch is per session, not per boot.** The trustlet does latch on the
+  first frame it *rejects* (result 39 `BAD_QUALITY`), and while latched every
+  later reply carries status `0x88000000` and `coverage=0`. But a **new**
+  trustlet session starts clean, so no reboot is needed — a fresh fprintd action
+  recovers. Only the 45 s power-down and the in-session `EnrollFinal` failed to
+  clear it.
+- **The trigger is an ordinary contact, not a gesture.** Samsung reports a
+  fingerprint press as a low-power gesture frame, and the controller only runs
+  that scan with the display *off*: on a lit panel `fod_state` sat at sequence 0
+  for a whole 300 s action with a finger on the sensor. The port's touchscreen
+  driver now takes the press edge from the ordinary coordinate event and
+  consumes it, which also stops the press opening a desktop context menu over
+  the target.
+- **The white target must sit on the sensor.** The overlay's geometry is the
+  Ultra's; on this panel it drew the circle at x=2424, where a pressing finger
+  only ever reached coverage 35 — a partly covered sensor. Centred on x=2300 and
+  widened to 200 px, coverage climbs to 100.
+- **The capture needs time.** The reference settles 180 ms after the press edge,
+  a *light* settle rather than a finger settle, so the capture landed while the
+  fingertip was still arriving. At 700 ms — what the hand-built harness used —
+  the operator can press firmly and roll, which is what lifts coverage.
+
+The illumination is the panel's own white content plus HBM (`fod_mode`), drawn by
+the `gts9u-fingerprint-overlay` GNOME extension, which also owns the UI lease that
+gates HBM. The whole working arrangement — including the four adaptations to the
+vendored driver and overlay, which live in the gitignored
+`ubuntu-galaxy-tab-s9-ultra/` tree — is written up in
+`docs/Fingerprint-Stack.md`.
+
+A no-match is now retried instead of ending the action. The driver reports a
+retry, fprintd restarts the verify, and each attempt **rebuilds the secure
+session** — which is the part that matters, because the TA's matcher answers
+once per identity per session and then repeats that answer: measured, 21
+captures from a single press inside one session returned one identical reply and
+none matched, while the same finger matched across separate sessions. Verified:
+10 attempts in one action produced 9 retries, 9 session rebuilds and 9 fresh
+actions, and one run matched on attempt 8.
+
+Verification now works with a **still press** — no rolling — taking about 3–4
+presses. The sensor images a patch of the fingerprint per frame, so a rolled
+template and a still probe disagree; re-enrolling with still presses (shifting
+position and finger part between presses, coverage still reaching 100) makes the
+template agree with the probe, and a longer capture settle (1200 ms, up from
+700 ms) gives a still finger time to settle and flatten. Two consecutive
+still-press verifications matched in 3 and 4 attempts.
+
+`docs/Fingerprint-Stack.md` records the arrangement, including how to read the
+capture-step count as the quality signal the identify path otherwise lacks.
 
 **GNOME's unlock path is already present** — Settings enrolment, GDM via PAM
 and the lock screen via gnome-shell — and only needs libfprint to see a reader.

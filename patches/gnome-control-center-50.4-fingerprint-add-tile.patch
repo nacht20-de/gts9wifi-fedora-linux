@@ -1,0 +1,70 @@
+diff -ruN a/panels/system/users/cc-fingerprint-dialog.blp b/panels/system/users/cc-fingerprint-dialog.blp
+--- a/panels/system/users/cc-fingerprint-dialog.blp
++++ b/panels/system/users/cc-fingerprint-dialog.blp
+@@ -248,11 +248,26 @@
+ }
+ 
+ Popover add_print_popover {
+-  position: bottom;
++  /* The finger list has to fit on screen. As a plain vertical box of ten
++   * entries this popover was taller than the space available around the tile,
++   * so the compositor could not place it and dismissed it the instant it was
++   * mapped. The popover therefore never appeared and the "Scan new
++   * fingerprint" tile did nothing at all. Capping the content height keeps
++   * the popover small enough to be placeable.
++   *
++   * autohide is off so the popover cannot be dismissed by the very click that
++   * opened it; on_enroll_cb() pops it down once a finger has been chosen. */
++  autohide: false;
+ 
+-  Box add_print_popover_box {
+-    can-focus: false;
+-    spacing: 6;
+-    orientation: vertical;
++  ScrolledWindow {
++    max-content-height: 260;
++    propagate-natural-height: true;
++    hscrollbar-policy: never;
++
++    Box add_print_popover_box {
++      can-focus: false;
++      spacing: 6;
++      orientation: vertical;
++    }
+   }
+ }
+diff -ruN a/panels/system/users/cc-fingerprint-dialog.c b/panels/system/users/cc-fingerprint-dialog.c
+--- a/panels/system/users/cc-fingerprint-dialog.c
++++ b/panels/system/users/cc-fingerprint-dialog.c
+@@ -956,6 +956,19 @@
+   GtkWidget *selected_button;
+ 
+   selected_button = g_object_get_data (G_OBJECT (child), "button");
++
++  if (GTK_IS_MENU_BUTTON (selected_button))
++    {
++      GtkPopover *popover;
++
++      popover = gtk_menu_button_get_popover (GTK_MENU_BUTTON (selected_button));
++      if (popover)
++        {
++          gtk_popover_popup (popover);
++          return;
++        }
++    }
++
+   g_signal_emit_by_name (GTK_MENU_BUTTON (selected_button), "activate");
+ }
+ 
+@@ -966,6 +979,11 @@
+   const char *finger_id;
+ 
+   finger_id = g_object_get_data (G_OBJECT (button), "finger-id");
++
++  if (self->add_print_popover &&
++      gtk_widget_get_visible (GTK_WIDGET (self->add_print_popover)))
++    gtk_popover_popdown (self->add_print_popover);
++
+   enroll_finger (self, finger_id);
+ }
+ 

@@ -124,7 +124,9 @@ CONFIG_INPUT_EVDEV=y
 CONFIG_INPUT_UINPUT=y
 CONFIG_UHID=y
 CONFIG_INPUT_TOUCHSCREEN=y
-CONFIG_TOUCHSCREEN_FTS1BA90A=y
+# Built as a module so the gesture arming can be changed and reloaded without
+# reflashing the kernel, and because nothing at boot needs the touchscreen.
+CONFIG_TOUCHSCREEN_FTS1BA90A=m
 
 # Out-of-tree Wacom WEZ01 S Pen digitizer (see wacom-wez01.c).
 CONFIG_TOUCHSCREEN_WACOM_WEZ01=y

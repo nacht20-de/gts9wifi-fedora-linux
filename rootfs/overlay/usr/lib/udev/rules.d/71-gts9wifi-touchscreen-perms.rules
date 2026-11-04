@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 #
-# The touchscreen driver's double_tap_to_wake toggle is root-only, so the
-# session cannot arm or disarm the gesture from its own UI (the gnome-gts9wifi
-# extension and /usr/libexec/gts9wifi-device-control).  Open the attribute to
-# group video, the same group 70-gts9wifi-devfreq-perms.rules uses, because
-# that is the group the seat user already has.
+# The touchscreen driver's double_tap_to_wake toggle and its wake_gesture arm
+# switch are root-only, so the session cannot arm or disarm the gesture from its
+# own UI (the gnome-gts9wifi extension, /usr/libexec/gts9wifi-device-control and
+# the sleep mode's power-key-watch).  Open both to group video, the same group
+# 70-gts9wifi-devfreq-perms.rules uses, because that is the group the seat user
+# already has.
 ACTION=="add|change", SUBSYSTEM=="i2c", KERNEL=="10-0049", \
-	RUN+="/bin/sh -c 'chgrp video %S%p/double_tap_to_wake && chmod 0664 %S%p/double_tap_to_wake'"
+	RUN+="/bin/sh -c 'for f in double_tap_to_wake wake_gesture; do chgrp video %S%p/$f && chmod 0664 %S%p/$f; done'"

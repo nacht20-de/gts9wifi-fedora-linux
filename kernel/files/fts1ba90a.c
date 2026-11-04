@@ -44,6 +44,31 @@
 #define FTS_SPONGE_NOTIFY		0xc0
 #define FTS_SPONGE_OFFSET_MODE		0x00
 #define FTS_MODE_DOUBLETAP_WAKEUP	BIT(5)
+#define FTS_MODE_PRESS			BIT(4)
+
+#define FTS_CMD_SET_FOD_FINGER_MERGE	0x3b
+/*
+ * The vendor driver also forwards the sensor window to the controller, at
+ * sponge offset 0x4b. This port deliberately does not. Setting it makes the
+ * controller apply its own fingerprint handling inside that window, which it
+ * only reports through the low-power gesture scan it runs with the display
+ * off - so the ordinary coordinate channel carrying the contact goes silent
+ * and the reader stops working entirely. Measured with a valid window written:
+ * the driver armed at 02:26:32 and logged no contact at all for the next 28 s
+ * while the finger pressed the sensor. The window is a kernel-side filter
+ * only; see fod_rect_store().
+ */
+
+/*
+ * A fingerprint contact arrives as a Samsung gesture frame with stype
+ * FTS_SPONGE_EVENT_PRESS and one of these ids. The libfprint driver needs the
+ * press and release edges to know when to light the panel and capture.
+ */
+#define FTS_SPONGE_EVENT_PRESS		3
+#define FTS_GESTURE_ID_FOD_LONG		0
+#define FTS_GESTURE_ID_FOD_NORMAL	1
+#define FTS_GESTURE_ID_FOD_RELEASE	2
+#define FTS_GESTURE_ID_FOD_OUT		3
 
 #define FTS_WAKEUP_GESTURE_DOUBLETAP	0x02
 
@@ -105,6 +130,13 @@ struct fts1ba90a {
 	struct regulator *vddio;
 	bool dtw_enabled;	/* user toggle; the gesture is armed per suspend */
 	bool lpm_suspended;	/* suspended with rails up and the gesture armed */
+	bool gesture_armed;	/* armed outside a suspend, for a sleeping system */
+	bool fod_enabled;	/* controller is in its fingerprint low-power mode */
+	u16 fod_rect_data[4];	/* sensor window: left, top, right, bottom */
+	u16 fod_x;		/* position of the last FOD gesture */
+	u16 fod_y;
+	bool fod_pressed;	/* last FOD press/release state */
+	u32 fod_sequence;	/* bumps per FOD gesture, so userspace sees an edge */
 	u8 events[FTS_FIFO_MAX * FTS_EVENT_SIZE];
 };
 
@@ -294,27 +326,40 @@ static int fts1ba90a_set_opmode(struct fts1ba90a *ts, u8 mode)
 }
 
 /*
- * Tell the firmware which low-power gestures it should watch for. The block is
- * written and then committed with a notify command; a firmware without the
- * gesture library simply ignores both.
+ * Write a block into the firmware's "sponge" area and commit it with a notify
+ * command carrying the same offset. A firmware without the block simply
+ * ignores both writes.
  */
-static int fts1ba90a_write_sponge_mode(struct fts1ba90a *ts, u8 mode)
+static int fts1ba90a_sponge_write(struct fts1ba90a *ts, u16 offset,
+				  const u8 *data, int len)
 {
-	u8 cmd[4];
+	u8 cmd[3 + 8];
 	int ret;
 
-	cmd[0] = FTS_SPONGE_READ_WRITE;
-	cmd[1] = (FTS_SPONGE_OFFSET_MODE >> 8) & 0xff;
-	cmd[2] = FTS_SPONGE_OFFSET_MODE & 0xff;
-	cmd[3] = mode;
+	if (len <= 0 || len > (int)sizeof(cmd) - 3)
+		return -EINVAL;
 
-	ret = fts1ba90a_write(ts, cmd, sizeof(cmd));
+	cmd[0] = FTS_SPONGE_READ_WRITE;
+	cmd[1] = (offset >> 8) & 0xff;
+	cmd[2] = offset & 0xff;
+	memcpy(&cmd[3], data, len);
+
+	ret = fts1ba90a_write(ts, cmd, 3 + len);
 	if (ret)
 		return ret;
 
+	/* The notify command reuses the offset bytes already in the buffer. */
 	cmd[0] = FTS_SPONGE_NOTIFY;
 
 	return fts1ba90a_write(ts, cmd, 3);
+}
+
+/*
+ * Tell the firmware which low-power gestures it should watch for.
+ */
+static int fts1ba90a_write_sponge_mode(struct fts1ba90a *ts, u8 mode)
+{
+	return fts1ba90a_sponge_write(ts, FTS_SPONGE_OFFSET_MODE, &mode, 1);
 }
 
 /*
@@ -375,6 +420,156 @@ static bool fts1ba90a_is_double_tap(const u8 *ev)
 	       ((ev[0] >> 6) & 0x3) == FTS_GESTURE_SAMSUNG_FEATURE &&
 	       ((ev[0] >> 2) & 0xf) == FTS_SPONGE_EVENT_DOUBLETAP &&
 	       ev[1] == FTS_GESTURE_ID_DOUBLETAP_WAKEUP;
+}
+
+/*
+ * A fingerprint press or release. The libfprint driver polls fod_state while
+ * it owns the sensor and treats a changed sequence number as a new contact
+ * edge, so every gesture - including a repeat of the current state - has to
+ * advance the counter. Coordinates use the same packing as the tap gestures.
+ *
+ * This is the vendor's path, and on this port it is the fallback: it only
+ * fires while the controller runs its low-power gesture scan, which it does
+ * with the display off. See fts1ba90a_fod_contact() for the path that works on
+ * a lit panel.
+ */
+static void fts1ba90a_report_fod(struct fts1ba90a *ts, const u8 *ev)
+{
+	if ((ev[0] & 0x3) != FTS_EV_GESTURE ||
+	    ((ev[0] >> 6) & 0x3) != FTS_GESTURE_SAMSUNG_FEATURE ||
+	    ((ev[0] >> 2) & 0xf) != FTS_SPONGE_EVENT_PRESS)
+		return;
+
+	switch (ev[1]) {
+	case FTS_GESTURE_ID_FOD_LONG:
+	case FTS_GESTURE_ID_FOD_NORMAL:
+		ts->fod_pressed = true;
+		break;
+	case FTS_GESTURE_ID_FOD_RELEASE:
+	case FTS_GESTURE_ID_FOD_OUT:
+		ts->fod_pressed = false;
+		break;
+	default:
+		return;
+	}
+
+	ts->fod_x = (ev[2] << 4) | (ev[4] >> 4);
+	ts->fod_y = (ev[3] << 4) | (ev[4] & 0xf);
+	ts->fod_sequence++;
+
+	dev_dbg(&ts->client->dev, "fingerprint FOD %s at %u,%u (seq %u)\n",
+		ts->fod_pressed ? "press" : "release", ts->fod_x, ts->fod_y,
+		ts->fod_sequence);
+}
+
+/*
+ * Is this contact inside the sensor window the driver published?
+ *
+ * With no window stored nothing can be classified, so do not gate: libfprint
+ * writes fod_rect before it arms the trigger, and a port that never writes one
+ * keeps the old behaviour of publishing every contact.
+ *
+ * A window that cannot describe this panel is treated the same way. The
+ * reference port inherited the Tab S9 Ultra's window (854 2732 994 2872),
+ * whose y range 2732-2872 starts past the bottom of this 1600x2560 panel;
+ * gating by it would silently reject every real press. An impossible window
+ * therefore filters nothing. That also makes the two halves of this change
+ * independent: a module with the gating can be loaded while the old libfprint
+ * still publishes the Ultra window, and the reader keeps working.
+ */
+static bool fts1ba90a_fod_in_rect(struct fts1ba90a *ts, unsigned int x,
+				  unsigned int y)
+{
+	u16 left = ts->fod_rect_data[0];
+	u16 top = ts->fod_rect_data[1];
+	u16 right = ts->fod_rect_data[2];
+	u16 bottom = ts->fod_rect_data[3];
+
+	if (!left && !top && !right && !bottom)
+		return true;
+	if (left > right || top > bottom)
+		return true;
+	if (right > FTS_MAX_X + 1 || bottom > FTS_MAX_Y + 1)
+		return true;
+
+	return x >= left && x <= right && y >= top && y <= bottom;
+}
+
+/*
+ * The press edge that actually fires with the display on.
+ *
+ * Samsung reports a fingerprint press as a low-power gesture frame, but the
+ * controller only runs that scan while the panel is off. On a lit panel no
+ * gesture frame arrives at all: measured with the panel illuminated, the
+ * driver armed and a finger held on the sensor, fod_state stayed at sequence 0
+ * for an entire 300 s libfprint action. The contact is still reported as an
+ * ordinary coordinate event, so take the edge from there.
+ *
+ * Only a contact inside the published sensor window belongs to the reader.
+ * Everything else is an ordinary touch and is handed to input: consuming every
+ * contact while the prompt was armed left the screen dead - a tap on "use
+ * password" did nothing - and, once libfprint took any press edge as a
+ * capture, each such tap also burned a retry and reported a no-match
+ * (measured: 101 of 311 captures in one evening were nowhere near the sensor).
+ *
+ * A move inside the window opens a contact too. A finger already resting on
+ * the circle when the trigger arms emits no PRESS frame of its own, so the
+ * first coordinate frame it does emit is how the reader learns it is there;
+ * after that the contact is latched and further moves are just updates.
+ */
+static bool fts1ba90a_fod_contact(struct fts1ba90a *ts, const u8 *ev)
+{
+	unsigned int action, x, y;
+
+	if (!ts->fod_enabled)
+		return false;
+	if ((ev[0] & 0x3) != FTS_EV_COORDINATE)
+		return false;
+
+	action = ev[0] >> 6;
+	x = (ev[1] << 4) | (ev[3] >> 4);
+	y = (ev[2] << 4) | (ev[3] & 0xf);
+
+	switch (action) {
+	case FTS_ACTION_PRESS:
+		if (!fts1ba90a_fod_in_rect(ts, x, y))
+			return false;
+		ts->fod_pressed = true;
+		ts->fod_sequence++;
+		break;
+	case FTS_ACTION_MOVE:
+		if (ts->fod_pressed)
+			return true;
+		if (!fts1ba90a_fod_in_rect(ts, x, y))
+			return false;
+		ts->fod_pressed = true;
+		ts->fod_sequence++;
+		break;
+	case FTS_ACTION_RELEASE:
+		/*
+		 * Release frames carry no coordinates, so ownership decides:
+		 * only the release of a contact this driver opened is ours. A
+		 * release we never took belongs to a touch input already has.
+		 */
+		if (!ts->fod_pressed)
+			return false;
+		ts->fod_pressed = false;
+		ts->fod_sequence++;
+		break;
+	default:
+		return false;
+	}
+
+	if (action != FTS_ACTION_RELEASE) {
+		ts->fod_x = x;
+		ts->fod_y = y;
+	}
+
+	dev_dbg(&ts->client->dev, "fingerprint FOD contact %s at %u,%u (seq %u)\n",
+		ts->fod_pressed ? "press" : "release", ts->fod_x, ts->fod_y,
+		ts->fod_sequence);
+
+	return true;
 }
 
 static void fts1ba90a_report_touch(struct fts1ba90a *ts, const u8 *ev)
@@ -493,6 +688,14 @@ static irqreturn_t fts1ba90a_irq_handler(int irq, void *dev_id)
 			continue;
 		}
 
+		if ((ev[0] & 0x3) == FTS_EV_GESTURE) {
+			fts1ba90a_report_fod(ts, ev);
+			continue;
+		}
+
+		if (fts1ba90a_fod_contact(ts, ev))
+			continue;
+
 		if (wacom_wez01_should_suppress_touch()) {
 			fts1ba90a_suppress_touch(ts);
 			break;
@@ -568,8 +771,197 @@ static ssize_t double_tap_to_wake_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(double_tap_to_wake);
 
+/*
+ * Arm the double-tap gesture without suspending.
+ *
+ * This port's sleep mode keeps the system running with the display off, and
+ * there the gesture is the only way a touch is noticed at all: the controller
+ * reports a wake key rather than the touch, and a wake key is what a running
+ * system needs to bring the display back.  Writing 1 arms it, 0 disarms it, and
+ * it does nothing unless double_tap_to_wake is on.
+ *
+ * Arming is an i2c conversation with the controller, so the interrupt is held
+ * off around it - the threaded handler reads events over the same bus.
+ */
+static ssize_t wake_gesture_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct fts1ba90a *ts = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", ts->gesture_armed);
+}
+
+static ssize_t wake_gesture_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct fts1ba90a *ts = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	if (!ts->dtw_enabled)
+		return -EOPNOTSUPP;
+
+	if (enable == ts->gesture_armed)
+		return count;
+
+	disable_irq(ts->client->irq);
+	if (enable) {
+		/* Release anything still down before the controller stops reporting. */
+		fts1ba90a_suppress_touch(ts);
+		ret = fts1ba90a_arm_gesture(ts);
+	} else {
+		ret = fts1ba90a_disarm_gesture(ts);
+	}
+	enable_irq(ts->client->irq);
+
+	if (ret)
+		return ret;
+
+	ts->gesture_armed = enable;
+	dev_info(dev, "wake gesture %s\n", enable ? "armed" : "disarmed");
+
+	return count;
+}
+static DEVICE_ATTR_RW(wake_gesture);
+
+/*
+ * Claim the reader for a capture.
+ *
+ * The libfprint driver writes 1 before it waits for a contact and requires a
+ * readback starting with '1'; writing 0 hands the panel back. The claim is
+ * therefore the driver's contract, and the readback is what it checks - it is
+ * not a request to put the controller into the vendor's FOD mode.
+ *
+ * The vendor's mode (FTS_MODE_PRESS plus the finger-merge command) is not used
+ * here. It only makes the controller report a press through its low-power
+ * gesture scan, which it runs with the display off, and it suppresses ordinary
+ * contact reporting while it is set - so on a lit panel it removes the only
+ * channel that still carries the contact. Measured with it set: fod_state held
+ * at sequence 0 for a whole 300 s action with the finger on the sensor.
+ *
+ * While claimed, ordinary contacts in the sensor area are consumed by
+ * fts1ba90a_fod_contact() and published as press edges instead of reaching
+ * input, so pressing the target cannot also open a desktop context menu.
+ */
+static ssize_t fod_enable_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct fts1ba90a *ts = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", ts->fod_enabled);
+}
+
+static ssize_t fod_enable_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct fts1ba90a *ts = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	/*
+	 * Clear the vendor's FOD mode rather than set it, so a controller left in
+	 * it by an earlier build returns to ordinary scanning. Writing 0 also
+	 * drops the double-tap wake flag; that gesture is armed again on suspend,
+	 * and this write only happens while a capture owns an awake panel.
+	 *
+	 * Arming is an i2c conversation; keep the threaded handler off the bus.
+	 */
+	disable_irq(ts->client->irq);
+	if (enable)
+		fts1ba90a_suppress_touch(ts);
+	ret = fts1ba90a_write_sponge_mode(ts, 0);
+	enable_irq(ts->client->irq);
+
+	if (ret)
+		return ret;
+
+	ts->fod_enabled = enable;
+	/*
+	 * Disarming drops the contact this driver was tracking: the release
+	 * frame either already passed or is dropped by the now-disabled trigger,
+	 * and a latch left set would make the next unrelated release look like
+	 * ours and be consumed, leaving a stuck touch in the UI.
+	 */
+	if (!enable && ts->fod_pressed) {
+		ts->fod_pressed = false;
+		ts->fod_sequence++;
+	}
+	dev_info(dev, "fingerprint FOD mode %s\n",
+		 enable ? "enabled" : "disabled");
+
+	return count;
+}
+static DEVICE_ATTR_RW(fod_enable);
+
+/*
+ * The libfprint driver tells the kernel where the sensor sits (left top right
+ * bottom, in panel coordinates) before it captures, and the kernel uses it to
+ * tell a fingerprint press from an ordinary tap. It is never forwarded to the
+ * controller; see the note where FTS_SPONGE_OFFSET_FOD_RECT used to be.
+ */
+static ssize_t fod_rect_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct fts1ba90a *ts = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u %u %u %u\n", ts->fod_rect_data[0],
+			  ts->fod_rect_data[1], ts->fod_rect_data[2],
+			  ts->fod_rect_data[3]);
+}
+
+static ssize_t fod_rect_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct fts1ba90a *ts = dev_get_drvdata(dev);
+	u16 rect[4];
+	int ret;
+
+	ret = sscanf(buf, "%hu %hu %hu %hu", &rect[0], &rect[1], &rect[2],
+		     &rect[3]);
+	if (ret != 4)
+		return -EINVAL;
+
+	memcpy(ts->fod_rect_data, rect, sizeof(rect));
+	dev_info(dev, "fingerprint FOD rect %u %u %u %u\n", rect[0], rect[1],
+		 rect[2], rect[3]);
+
+	return count;
+}
+static DEVICE_ATTR_RW(fod_rect);
+
+/*
+ * Press state plus a sequence number that changes on every FOD gesture. The
+ * driver polls this; a stale sequence would make a new contact invisible and a
+ * finger that never moved would look like one that did.
+ */
+static ssize_t fod_state_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct fts1ba90a *ts = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s %u %u %u\n",
+			  ts->fod_pressed ? "pressed" : "released",
+			  ts->fod_x, ts->fod_y, ts->fod_sequence);
+}
+static DEVICE_ATTR_RO(fod_state);
+
 static struct attribute *fts1ba90a_attrs[] = {
 	&dev_attr_double_tap_to_wake.attr,
+	&dev_attr_wake_gesture.attr,
+	&dev_attr_fod_enable.attr,
+	&dev_attr_fod_rect.attr,
+	&dev_attr_fod_state.attr,
 	NULL,
 };
 
@@ -711,6 +1103,9 @@ static int fts1ba90a_resume(struct device *dev)
 
 	if (ts->lpm_suspended) {
 		ts->lpm_suspended = false;
+
+		/* the suspend path leaves the controller disarmed */
+		ts->gesture_armed = false;
 
 		disable_irq_wake(ts->client->irq);
 

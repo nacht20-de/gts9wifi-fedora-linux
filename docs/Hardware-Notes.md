@@ -443,10 +443,17 @@ Testing notes:
 
 Status: the Linux half and the whole secure processor are up — the sensor's
 3.3 V rail is published, the trustlet loads and verifies, and the SPU boots
-with its Android userspace peers (`sec_nvm`, `spdaemon`). The session stops at
-the TEE's `KEYMASTER_NOT_CONFIGURED`; what remains is the secure owner that
-configures `sp_keymaster` and restores HwVault credential 11, plus panel
-`cell_id`/HBM handling and a libfprint backend.
+with its Android userspace peers (`sec_nvm`, `spdaemon`). The keymaster boundary
+is cleared: StrongBox is configured, the boot-only secure owner prints
+`SECURE_READY`, and the trustlet reaches a calibrated `Prepare`. Panel HBM and
+the module `cell_id` are in as well (`fod_mode`, `fod_circle`, `fod_brightness`,
+`fod_ready`).
+
+The blocker is the capture path: the reader accepts four samples and then latches
+(result 39 `BAD_QUALITY`, status `0x80000000`) until it is powered down for about
+45 s, which is far fewer samples than enrolment needs. After that comes the
+userspace half — a libfprint backend, fprintd, the GNOME Shell target overlay and
+the FTS FOD touch handling.
 
 GNOME's unlock plumbing is already complete — Settings enrolment, GDM via PAM,
 gnome-shell lock screen — and only needs libfprint to see a reader. On any
