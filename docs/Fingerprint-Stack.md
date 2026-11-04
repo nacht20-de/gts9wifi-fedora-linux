@@ -754,3 +754,39 @@ A useful side effect of the numbers: the settle sets the minimum press length,
 because a release before the deadline aborts the capture with `held; finger
 released early` and the driver then waits for a fresh contact. At 1200 ms a
 one-second tap captured nothing; at 700 ms it captures on the first try.
+
+## Long uptime: the TEE allocations must not need a free 2 MiB block
+
+After 22 h of uptime a lock-screen verify failed with
+`fprintd: page allocation failure: order:9` in `tee_dyn_shm_alloc_helper`, and
+fprintd reported `cannot allocate the signed TA memory object`. The zone had
+325 MB free but no free block of 2 MiB or larger.
+
+The request is the **HwVault TA image**: fprintd loads `hwvault` itself
+whenever it is not resident (1,114,200 bytes, traced with a kprobe on
+`tee_shm_alloc_user_buf`). The TZMEM patch only sent buffers of 2 MiB and up to
+the TZMEM pool, so this one was a single `alloc_pages_exact()` block — order 9,
+which the page allocator does not reclaim hard for.
+
+`kernel/patches/qcomtee-use-tzmem-pool.patch` now sends every memory object
+over 32 KiB (`PAGE_ALLOC_COSTLY_ORDER`) to the TZMEM pool. Its areas come from
+CMA and are never returned, so the area grown for the 19 MiB `dualfp` image on
+the first session serves every later session; a second session under
+fragmentation grew the pool zero times. QTEE **messages** (`TEE_SHM_PRIV`) stay
+page-backed: with HwVault's 160 KiB send-command message in TZMEM the command
+succeeded but its response came back empty (`HwVault signed-GET response is
+invalid (status=4294967295)`).
+
+Reproduced and verified on 2026-11-04 by pinning one page in every 2 MiB
+pageblock (vmsplice references, CMA left alone) until no non-CMA order >= 9
+block was free:
+
+| module | result under fragmentation |
+| --- | --- |
+| previous patch | `page allocation failure: order:9`, open fails |
+| this patch | no allocation failure; the open reaches the same point as an unfragmented boot |
+
+Order 6 remains: the 164,456-byte HwVault messages are still one page-backed
+block each. They have not failed in practice — order-6 blocks stayed plentiful
+in every fragmented state measured — but they are the next thing a long uptime
+could exhaust.
