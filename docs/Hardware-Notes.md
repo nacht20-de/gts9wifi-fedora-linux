@@ -496,7 +496,7 @@ the console up to a hang, is still there on the next boot.
 | Item | Value |
 |---|---|
 | Region | `ramoops@880900000`, 2 MiB, Samsung's former `sec_pmsg` range |
-| Layout | 4 × 256 KiB dmesg, 512 KiB console, 256 KiB pmsg, 256 KiB ftrace (per CPU), ECC on |
+| Layout | 4 × 256 KiB dmesg, 512 KiB console, 256 KiB pmsg, 256 KiB ftrace (per CPU); `ecc-size` 96 leaves about 57% of each zone for data |
 | While booted | `/sys/fs/pstore` (root only) |
 | Archived | `/var/lib/systemd/pstore/`, moved there by `systemd-pstore.service` early in the next boot |
 
@@ -526,17 +526,25 @@ detectors (ABL appends `nowatchdog`, so the file switches them back on).
 there is no Gunyah watchdog, and the DT has no APSS watchdog node. A wedge that
 stops every CPU therefore only shows up in the console record.
 
-How much survives depends on how the tablet resets:
+Every reset seen so far flips a large share of the bits in the region, so
+records come back partly garbled. The flips are scattered single-bit errors,
+which looks like DRAM losing refresh during the reset; the bootloader does not
+seem to overwrite the range. ECC repairs a block only while it has few enough
+bad bytes, and leaves the rest as raw, garbled text. The kernel discards a
+dmesg record whose first line or deflate stream is damaged, so the panic dump
+itself has not survived any reset yet. The console record does survive, and
+the panic message and call trace in it stay readable through the typos.
 
-| Reset | Result |
-|---|---|
-| Panic → PSCI `SYSTEM_RESET` (`echo c > /proc/sysrq-trigger`) | console and pmsg back, with scattered bit flips; the dmesg record's header did not survive |
-| Panic with `/sys/kernel/reboot/mode` = `warm` | `SYSTEM_RESET2` fails ("Reboot failed -- System halted") and the tablet stays halted until a hard restart, which flips even more bits; do not use `reboot=warm` |
-| Long power-off, or the forced reset after the Nov 2 hang | nothing, every header unrecoverable |
+| Reset | ECC | Result |
+|---|---|---|
+| Panic → PSCI `SYSTEM_RESET` (`echo c > /proc/sysrq-trigger`) | 16 | console and pmsg back, every console block unrecoverable; no dmesg |
+| Clean `systemctl reboot` (also `SYSTEM_RESET`) | 16 | console back, every block unrecoverable |
+| Panic with `/sys/kernel/reboot/mode` = `warm` | 16 | `SYSTEM_RESET2` fails ("Reboot failed -- System halted"), and the tablet stays halted until a hard restart; do not use `reboot=warm` |
+| Panic → `SYSTEM_RESET` | 96 | pmsg back intact; console 611 of ~630 blocks unrecoverable; zone headers repaired with 20–31 bad bytes each; no dmesg |
+| Long power-off, or the forced reset after the Nov 2 hang | 16 | nothing, every header unrecoverable |
 
-The flips look like DRAM losing refresh during the reset, not like the
-bootloader overwriting the region. Each 128-byte ECC block can only repair 8
-bad bytes, so many blocks stay unreadable.
+A clean record needs a reset that keeps DRAM in self-refresh: a PMIC warm reset,
+which nothing in mainline configures here, or kdump, which never resets at all.
 
 ---
 
